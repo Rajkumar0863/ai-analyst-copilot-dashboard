@@ -7,8 +7,10 @@ st.set_page_config(page_title="AI Analyst Copilot Dashboard", layout="wide")
 
 st.title("AI Analyst Copilot Dashboard")
 st.subheader("Upload a CSV or Excel file and get business-focused analysis")
+st.markdown("### Turn raw data into actionable business insights instantly.")
 
 uploaded_file = st.file_uploader("Upload your file", type=["csv", "xlsx"])
+st.markdown("### Turn raw data into actionable business insights instantly.")
 
 
 def load_file(file):

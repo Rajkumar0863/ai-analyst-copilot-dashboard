@@ -10,7 +10,7 @@ st.subheader("Upload a CSV or Excel file and get business-focused analysis")
 st.markdown("### Turn raw data into actionable business insights instantly.")
 
 uploaded_file = st.file_uploader("Upload your file", type=["csv", "xlsx"])
-st.markdown("### Turn raw data into actionable business insights instantly.")
+st.caption("Tip: Upload sales or transaction data for best results.")
 
 
 def load_file(file):

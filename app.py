@@ -8,7 +8,7 @@ st.set_page_config(page_title="AI Analyst Copilot Dashboard", layout="wide")
 
 st.title("AI Analyst Copilot Dashboard")
 st.subheader("Upload a CSV or Excel file and get business-focused analysis")
-st.subheader("### Turn raw data into actionable business insights instantly.")
+st.subheader("Turn raw data into actionable business insights instantly.")
 st.caption("Upload a CSV or Excel file to explore KPIs, trends, product performance, and business insights.")
 
 

@@ -16,7 +16,20 @@ st.set_page_config(
 # =========================
 ID_KEYWORDS = [
     "id", "order_id", "product_id", "customer_id", "invoice", "transaction_id",
-    "user_id", "record_id", "item_id", "code", "sku", "empid", "employeeid"
+    "user_id", "record_id", "item_id", "code", "sku", "empid", "employeeid",
+    "reference", "ref", "account_id", "customer_code"
+]
+
+BUSINESS_METRIC_KEYWORDS = [
+    "sales", "revenue", "profit", "amount", "price", "cost", "quantity",
+    "income", "expense", "salary", "rate", "score", "total", "value",
+    "count", "margin", "growth", "hours", "workingyears", "years"
+]
+
+CATEGORY_PRIORITY_KEYWORDS = [
+    "country", "region", "department", "category", "segment", "product",
+    "jobrole", "educationfield", "gender", "attrition", "businesstravel",
+    "maritalstatus", "overtime", "agegroup"
 ]
 
 
@@ -31,6 +44,13 @@ def safe_to_datetime(series: pd.Series) -> pd.Series:
 
 def normalize_column_name(col: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]+", "_", str(col).strip().lower())
+
+
+def is_integer_like(series: pd.Series) -> bool:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if clean.empty:
+        return False
+    return np.all(np.isclose(clean, clean.astype(int)))
 
 
 def detect_column_types(df: pd.DataFrame):
@@ -60,7 +80,7 @@ def detect_column_types(df: pd.DataFrame):
 
         if col in numeric_cols:
             nunique_ratio = temp_df[col].nunique(dropna=True) / max(len(temp_df), 1)
-            if nunique_ratio > 0.85:
+            if nunique_ratio > 0.95 and is_integer_like(temp_df[col]):
                 identifier_cols.append(col)
 
     numeric_measure_cols = [c for c in numeric_cols if c not in identifier_cols]
@@ -114,6 +134,46 @@ def get_outlier_mask(series: pd.Series):
     return (clean < lower) | (clean > upper)
 
 
+def pick_best_metric_column(numeric_cols):
+    if not numeric_cols:
+        return None
+
+    for col in numeric_cols:
+        if any(keyword in col.lower() for keyword in BUSINESS_METRIC_KEYWORDS):
+            return col
+
+    bad_fallbacks = {"age", "employeecount", "standardhours"}
+    filtered = [col for col in numeric_cols if col.lower() not in bad_fallbacks]
+    return filtered[0] if filtered else numeric_cols[0]
+
+
+def pick_best_category_column(categorical_cols):
+    if not categorical_cols:
+        return None
+
+    for col in categorical_cols:
+        if any(keyword in col.lower() for keyword in CATEGORY_PRIORITY_KEYWORDS):
+            return col
+
+    return categorical_cols[0]
+
+
+def pick_best_datetime_column(datetime_cols):
+    return datetime_cols[0] if datetime_cols else None
+
+
+def classify_dataset(categorical_cols, numeric_cols, all_cols):
+    joined = " ".join([c.lower() for c in all_cols])
+
+    if any(word in joined for word in ["attrition", "jobrole", "department", "overtime", "employee"]):
+        return "hr"
+    if any(word in joined for word in ["sales", "revenue", "product", "customer", "order", "quantity"]):
+        return "sales"
+    if any(word in joined for word in ["profit", "expense", "cost", "income", "margin", "finance"]):
+        return "finance"
+    return "general"
+
+
 def recommend_chart_type(df, x_col, y_col, numeric_cols, categorical_cols, datetime_cols, identifier_cols):
     x_is_numeric = x_col in numeric_cols
     y_is_numeric = y_col in numeric_cols if y_col else False
@@ -126,7 +186,7 @@ def recommend_chart_type(df, x_col, y_col, numeric_cols, categorical_cols, datet
 
     if x_is_numeric and y_is_numeric:
         if x_col in identifier_cols:
-            return "bar_top_n", "This looks like an identifier field, so aggregated bar charts are more meaningful than a scatter plot."
+            return "bar_top_n", "This looks like an identifier field, so an aggregated Top N bar chart is more meaningful than a scatter plot."
         return "scatter", "A scatter plot is best for exploring relationships, clusters, or outliers between two numeric variables."
 
     if x_is_categorical and y_is_numeric:
@@ -145,7 +205,19 @@ def recommend_chart_type(df, x_col, y_col, numeric_cols, categorical_cols, datet
     return "bar", "A bar chart is the safest default for this selection."
 
 
-def build_chart(df, x_col, y_col, chart_type, top_n=10):
+def aggregate_data(grouped_df, x_col, y_col, agg_method):
+    if agg_method == "sum":
+        return grouped_df.groupby(x_col, as_index=False)[y_col].sum()
+    if agg_method == "mean":
+        return grouped_df.groupby(x_col, as_index=False)[y_col].mean()
+    if agg_method == "median":
+        return grouped_df.groupby(x_col, as_index=False)[y_col].median()
+    if agg_method == "count":
+        return grouped_df.groupby(x_col, as_index=False)[y_col].count()
+    return grouped_df.groupby(x_col, as_index=False)[y_col].sum()
+
+
+def build_chart(df, x_col, y_col, chart_type, top_n=10, agg_method="sum"):
     chart_df = df.copy()
 
     if chart_type == "line":
@@ -157,31 +229,19 @@ def build_chart(df, x_col, y_col, chart_type, top_n=10):
         return px.scatter(chart_df, x=x_col, y=y_col, title=f"{x_col} vs {y_col}", opacity=0.7)
 
     if chart_type == "bar":
-        grouped = (
-            chart_df[[x_col, y_col]]
-            .dropna()
-            .groupby(x_col, as_index=False)[y_col]
-            .sum()
-            .sort_values(by=y_col, ascending=False)
-        )
-        return px.bar(grouped, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
+        grouped = aggregate_data(chart_df[[x_col, y_col]].dropna(), x_col, y_col, agg_method)
+        grouped = grouped.sort_values(by=y_col, ascending=False)
+        return px.bar(grouped, x=x_col, y=y_col, title=f"{agg_method.title()} {y_col} by {x_col}")
 
     if chart_type == "bar_top_n":
-        grouped = (
-            chart_df[[x_col, y_col]]
-            .dropna()
-            .groupby(x_col, as_index=False)[y_col]
-            .sum()
-            .sort_values(by=y_col, ascending=False)
-            .head(top_n)
-            .sort_values(by=y_col, ascending=True)
-        )
+        grouped = aggregate_data(chart_df[[x_col, y_col]].dropna(), x_col, y_col, agg_method)
+        grouped = grouped.sort_values(by=y_col, ascending=False).head(top_n).sort_values(by=y_col, ascending=True)
         return px.bar(
             grouped,
             x=y_col,
             y=x_col,
             orientation="h",
-            title=f"Top {top_n} {x_col} by {y_col}"
+            title=f"Top {top_n} {x_col} by {agg_method.title()} {y_col}"
         )
 
     if chart_type == "histogram":
@@ -244,10 +304,16 @@ def moving_average_projection(df, date_col, value_col, window=7, projection_poin
 
 
 def strongest_correlations(df, numeric_cols):
-    if len(numeric_cols) < 2:
-        return []
+    valid_numeric_cols = []
+    for col in numeric_cols:
+        clean = pd.to_numeric(df[col], errors="coerce")
+        if clean.nunique(dropna=True) > 1:
+            valid_numeric_cols.append(col)
 
-    corr = df[numeric_cols].corr(numeric_only=True)
+    if len(valid_numeric_cols) < 2:
+        return [], valid_numeric_cols
+
+    corr = df[valid_numeric_cols].corr(numeric_only=True)
     pairs = []
 
     for i in range(len(corr.columns)):
@@ -257,7 +323,7 @@ def strongest_correlations(df, numeric_cols):
             if pd.notna(val):
                 pairs.append((col1, col2, val))
 
-    return sorted(pairs, key=lambda x: abs(x[2]), reverse=True)[:5]
+    return sorted(pairs, key=lambda x: abs(x[2]), reverse=True)[:5], valid_numeric_cols
 
 
 def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
@@ -290,8 +356,8 @@ def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
                 )
 
     if datetime_cols and numeric_cols:
-        date_col = datetime_cols[0]
-        metric_col = numeric_cols[0]
+        date_col = pick_best_datetime_column(datetime_cols)
+        metric_col = pick_best_metric_column(numeric_cols)
         temp = df[[date_col, metric_col]].dropna().copy()
         temp[metric_col] = pd.to_numeric(temp[metric_col], errors="coerce")
         temp = temp.dropna()
@@ -311,7 +377,7 @@ def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
                     f"The peak value of '{metric_col}' occurred on {peak_row[date_col]} with a total of {peak_row[metric_col]:.2f}."
                 )
 
-    top_corrs = strongest_correlations(df, numeric_cols)
+    top_corrs, _ = strongest_correlations(df, numeric_cols)
     if top_corrs:
         col1, col2, corr_val = top_corrs[0]
         strength = "strong" if abs(corr_val) >= 0.7 else "moderate" if abs(corr_val) >= 0.4 else "weak"
@@ -323,52 +389,64 @@ def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
     return insights
 
 
-def generate_executive_summary(df, numeric_cols, categorical_cols, datetime_cols):
+def generate_executive_summary(df, numeric_cols, categorical_cols, datetime_cols, all_cols):
     summary = []
+    dataset_type = classify_dataset(categorical_cols, numeric_cols, all_cols)
 
-    if datetime_cols and numeric_cols:
-        date_col = datetime_cols[0]
-        value_col = numeric_cols[0]
+    best_metric = pick_best_metric_column(numeric_cols)
+    best_category = pick_best_category_column(categorical_cols)
+    best_date = pick_best_datetime_column(datetime_cols)
 
-        temp = df[[date_col, value_col]].dropna().copy()
-        temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
+    if best_date and best_metric:
+        temp = df[[best_date, best_metric]].dropna().copy()
+        temp[best_metric] = pd.to_numeric(temp[best_metric], errors="coerce")
         temp = temp.dropna()
 
         if not temp.empty:
-            trend = temp.groupby(date_col)[value_col].sum().sort_index()
+            trend = temp.groupby(best_date)[best_metric].sum().sort_index()
             if len(trend) >= 2:
                 change = trend.iloc[-1] - trend.iloc[0]
                 direction = "increasing" if change > 0 else "decreasing"
-                summary.append(f"📈 Overall trend shows a {direction} pattern in '{value_col}'.")
+                summary.append(f"📈 Overall trend shows a {direction} pattern in '{best_metric}'.")
 
-    if categorical_cols and numeric_cols:
-        cat = categorical_cols[0]
-        num = numeric_cols[0]
+    if best_category:
+        vc = df[best_category].astype(str).value_counts(dropna=False)
+        if not vc.empty:
+            top_group = vc.index[0]
+            top_count = vc.iloc[0]
 
-        grouped = (
-            df[[cat, num]]
-            .dropna()
-            .groupby(cat)[num]
-            .sum()
-            .sort_values(ascending=False)
-        )
-        if not grouped.empty:
-            summary.append(f"🏆 Top '{cat}' is '{grouped.index[0]}' contributing the highest '{num}'.")
+            if dataset_type == "hr":
+                summary.append(f"👥 Largest employee group in '{best_category}' is '{top_group}' with {top_count:,} records.")
+            else:
+                if best_metric:
+                    grouped = (
+                        df[[best_category, best_metric]]
+                        .dropna()
+                        .groupby(best_category)[best_metric]
+                        .sum()
+                        .sort_values(ascending=False)
+                    )
+                    if not grouped.empty:
+                        summary.append(
+                            f"🏆 Top '{best_category}' is '{grouped.index[0]}' based on summed '{best_metric}'."
+                        )
+                else:
+                    summary.append(f"🏆 Most frequent value in '{best_category}' is '{top_group}' with {top_count:,} records.")
 
-    if numeric_cols:
-        col = numeric_cols[0]
-        outliers = get_outlier_mask(df[col])
-        if outliers.sum() > 0:
-            summary.append(f"⚠️ Detected {int(outliers.sum())} anomalies in '{col}', which may skew analysis.")
+    if best_metric:
+        outliers = get_outlier_mask(df[best_metric])
+        outlier_count = int(outliers.sum())
+        if outlier_count > 0:
+            summary.append(f"⚠️ Detected {outlier_count} anomalies in '{best_metric}', which may skew analysis.")
         else:
-            summary.append(f"✅ No major anomalies detected in '{col}' based on the IQR method.")
+            summary.append(f"✅ No major anomalies detected in '{best_metric}' based on the IQR method.")
 
-    corr_pairs = strongest_correlations(df, numeric_cols)
+    corr_pairs, _ = strongest_correlations(df, numeric_cols)
     if corr_pairs:
         c1, c2, val = corr_pairs[0]
         summary.append(f"🔗 Strong relationship found between '{c1}' and '{c2}' ({val:.2f}).")
 
-    summary.append("💡 Focus on the top drivers, review anomalies, and validate patterns before making business decisions.")
+    summary.append("💡 Insights are auto-generated. Validate important findings before making business decisions.")
 
     return summary
 
@@ -428,22 +506,23 @@ if uploaded_file is not None:
     st.sidebar.header("Filters")
     filtered_df = df.copy()
 
-    with st.sidebar.expander("Time Filters", expanded=True):
-        for col in datetime_cols:
-            series = filtered_df[col].dropna()
-            if not series.empty:
-                min_date = series.min().date()
-                max_date = series.max().date()
-                selected_range = st.date_input(
-                    f"Filter {col}",
-                    value=(min_date, max_date),
-                    key=f"time_{col}"
-                )
-                if isinstance(selected_range, tuple) and len(selected_range) == 2:
-                    start_date, end_date = selected_range
-                    filtered_df = filtered_df[
-                        filtered_df[col].dt.date.between(start_date, end_date)
-                    ]
+    if datetime_cols:
+        with st.sidebar.expander("Time Filters", expanded=True):
+            for col in datetime_cols:
+                series = filtered_df[col].dropna()
+                if not series.empty:
+                    min_date = series.min().date()
+                    max_date = series.max().date()
+                    selected_range = st.date_input(
+                        f"Filter {col}",
+                        value=(min_date, max_date),
+                        key=f"time_{col}"
+                    )
+                    if isinstance(selected_range, tuple) and len(selected_range) == 2:
+                        start_date, end_date = selected_range
+                        filtered_df = filtered_df[
+                            filtered_df[col].dt.date.between(start_date, end_date)
+                        ]
 
     with st.sidebar.expander("Categorical Filters", expanded=True):
         for col in categorical_cols[:12]:
@@ -471,15 +550,17 @@ if uploaded_file is not None:
                         pd.to_numeric(filtered_df[col], errors="coerce").between(selected_range[0], selected_range[1])
                     ]
 
+    selected_outlier_col = None
     with st.sidebar.expander("Analysis Options", expanded=False):
         remove_outliers = st.checkbox("Exclude outliers from charts", value=False)
         show_data_preview = st.checkbox("Show filtered data preview", value=True)
         top_n = st.slider("Top N for high-cardinality charts", min_value=5, max_value=25, value=10)
+        if numeric_cols:
+            selected_outlier_col = st.selectbox("Outlier column", ["<None>"] + numeric_cols)
 
-    if remove_outliers and numeric_cols:
-        for col in numeric_cols:
-            mask = get_outlier_mask(filtered_df[col])
-            filtered_df = filtered_df[~mask]
+    if remove_outliers and selected_outlier_col and selected_outlier_col != "<None>":
+        mask = get_outlier_mask(filtered_df[selected_outlier_col])
+        filtered_df = filtered_df[~mask]
 
     # =========================
     # KPI Cards
@@ -503,7 +584,13 @@ if uploaded_file is not None:
     # Executive Summary
     # =========================
     st.subheader("Executive Summary")
-    exec_summary = generate_executive_summary(filtered_df, numeric_cols, categorical_cols, datetime_cols)
+    exec_summary = generate_executive_summary(
+        filtered_df,
+        numeric_cols,
+        categorical_cols,
+        datetime_cols,
+        filtered_df.columns.tolist()
+    )
 
     for item in exec_summary:
         st.success(item)
@@ -566,7 +653,12 @@ if uploaded_file is not None:
         with left:
             if numeric_cols:
                 selected_hist_col = st.selectbox("Numeric distribution", numeric_cols, key="overview_hist")
-                hist_fig = px.histogram(filtered_df, x=selected_hist_col, nbins=30, title=f"Distribution of {selected_hist_col}")
+                hist_fig = px.histogram(
+                    filtered_df,
+                    x=selected_hist_col,
+                    nbins=30,
+                    title=f"Distribution of {selected_hist_col}"
+                )
                 st.plotly_chart(hist_fig, use_container_width=True)
 
         with right:
@@ -600,6 +692,14 @@ if uploaded_file is not None:
         y_choice = st.selectbox("Select Y-axis / metric column", y_options)
         y_col = None if y_choice == "<None>" else y_choice
 
+        agg_method = "sum"
+        if y_col is not None:
+            agg_method = st.selectbox(
+                "Aggregation method",
+                ["sum", "mean", "median", "count"],
+                index=1
+            )
+
         chart_type, chart_reason = recommend_chart_type(
             filtered_df, x_col, y_col, numeric_cols, categorical_cols, datetime_cols, identifier_cols
         )
@@ -607,8 +707,18 @@ if uploaded_file is not None:
         st.write(f"**Recommended chart type:** {chart_type.replace('_', ' ').title()}")
         st.caption(chart_reason)
 
+        if y_col and chart_type in ["bar", "bar_top_n"]:
+            st.caption(f"This chart uses **{agg_method}** aggregation for '{y_col}' grouped by '{x_col}'.")
+
         try:
-            fig = build_chart(filtered_df, x_col, y_col, chart_type, top_n=top_n)
+            fig = build_chart(
+                filtered_df,
+                x_col,
+                y_col,
+                chart_type,
+                top_n=top_n,
+                agg_method=agg_method
+            )
             st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             st.error(f"Could not build chart: {e}")
@@ -652,20 +762,20 @@ if uploaded_file is not None:
         else:
             st.warning("Not enough data to generate insights.")
 
-        if numeric_cols:
-            st.markdown("### Correlation Heatmap")
-            if len(numeric_cols) >= 2:
-                corr = filtered_df[numeric_cols].corr(numeric_only=True)
-                heatmap_fig = px.imshow(
-                    corr,
-                    text_auto=".2f",
-                    aspect="auto",
-                    title="Interactive Correlation Heatmap"
-                )
-                st.plotly_chart(heatmap_fig, use_container_width=True)
-                st.caption("This heatmap shows how strongly numeric variables are related to each other.")
-            else:
-                st.info("Need at least two numeric columns for correlation analysis.")
+        st.markdown("### Correlation Heatmap")
+        corr_pairs, valid_corr_cols = strongest_correlations(filtered_df, numeric_cols)
+        if len(valid_corr_cols) >= 2:
+            corr = filtered_df[valid_corr_cols].corr(numeric_only=True)
+            heatmap_fig = px.imshow(
+                corr,
+                text_auto=".2f",
+                aspect="auto",
+                title="Interactive Correlation Heatmap"
+            )
+            st.plotly_chart(heatmap_fig, use_container_width=True)
+            st.caption("This heatmap shows how strongly useful numeric variables are related to each other.")
+        else:
+            st.info("Need at least two non-constant numeric columns for correlation analysis.")
 
         if numeric_cols:
             st.markdown("### Outlier Check")

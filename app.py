@@ -1,588 +1,681 @@
+import io
+import re
 import numpy as np
 import pandas as pd
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
 
-st.set_page_config(page_title="AI Analyst Copilot Dashboard", layout="wide")
+st.set_page_config(
+    page_title="AI Analyst Copilot Dashboard",
+    page_icon="📊",
+    layout="wide"
+)
 
-
-# ---------------------------
+# =========================
 # Helpers
-# ---------------------------
-def format_compact_number(value):
-    if value is None or pd.isna(value):
+# =========================
+ID_KEYWORDS = [
+    "id", "order_id", "product_id", "customer_id", "invoice", "transaction_id",
+    "user_id", "record_id", "item_id", "code", "sku"
+]
+
+
+def safe_to_datetime(series: pd.Series) -> pd.Series:
+    """Try converting a series to datetime safely."""
+    try:
+        converted = pd.to_datetime(series, errors="coerce")
+        valid_ratio = converted.notna().mean()
+        return converted if valid_ratio > 0.7 else series
+    except Exception:
+        return series
+
+
+def normalize_column_name(col: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_]+", "_", str(col).strip().lower())
+
+
+def detect_column_types(df: pd.DataFrame):
+    """Detect numeric, categorical, datetime, and identifier-like columns."""
+    temp_df = df.copy()
+    temp_df.columns = [str(c) for c in temp_df.columns]
+
+    datetime_cols = []
+    for col in temp_df.columns:
+        if temp_df[col].dtype == "object":
+            converted = safe_to_datetime(temp_df[col])
+            if pd.api.types.is_datetime64_any_dtype(converted):
+                temp_df[col] = converted
+                datetime_cols.append(col)
+        elif pd.api.types.is_datetime64_any_dtype(temp_df[col]):
+            datetime_cols.append(col)
+
+    numeric_cols = temp_df.select_dtypes(include=np.number).columns.tolist()
+    all_cols = temp_df.columns.tolist()
+
+    identifier_cols = []
+    for col in all_cols:
+        col_lower = col.lower().strip()
+
+        # Rule 1: name suggests ID
+        if any(keyword in col_lower for keyword in ID_KEYWORDS):
+            identifier_cols.append(col)
+            continue
+
+        # Rule 2: high uniqueness in integer/numeric column often means identifier
+        if col in numeric_cols:
+            nunique_ratio = temp_df[col].nunique(dropna=True) / max(len(temp_df), 1)
+            if nunique_ratio > 0.85:
+                identifier_cols.append(col)
+
+    numeric_measure_cols = [c for c in numeric_cols if c not in identifier_cols]
+    categorical_cols = [
+        c for c in all_cols
+        if c not in numeric_cols and c not in datetime_cols
+    ]
+
+    return temp_df, numeric_measure_cols, categorical_cols, datetime_cols, identifier_cols
+
+
+def format_number(value):
+    if pd.isna(value):
         return "N/A"
-
-    value = float(value)
-    abs_value = abs(value)
-
-    if abs_value >= 1_000_000_000:
-        return f"{value / 1_000_000_000:.2f}B"
-    if abs_value >= 1_000_000:
-        return f"{value / 1_000_000:.2f}M"
-    if abs_value >= 1_000:
-        return f"{value / 1_000:.2f}K"
-    if value.is_integer():
-        return f"{int(value):,}"
-    return f"{value:,.2f}"
+    if abs(value) >= 1_000_000:
+        return f"{value:,.2f}"
+    if abs(value) >= 1_000:
+        return f"{value:,.2f}"
+    return f"{value:.2f}" if isinstance(value, (int, float, np.number)) else str(value)
 
 
-def format_full_number(value, decimals=2):
-    if value is None or pd.isna(value):
-        return "N/A"
-    if decimals == 0:
-        return f"{int(round(value)):,}"
-    return f"{value:,.{decimals}f}"
+def compute_metric(series: pd.Series, agg: str):
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if clean.empty:
+        return np.nan
+
+    if agg == "sum":
+        return clean.sum()
+    if agg == "mean":
+        return clean.mean()
+    if agg == "median":
+        return clean.median()
+    if agg == "min":
+        return clean.min()
+    if agg == "max":
+        return clean.max()
+    if agg == "count":
+        return clean.count()
+    if agg == "std":
+        return clean.std()
+    return np.nan
 
 
-# ---------------------------
-# File loading
-# ---------------------------
-def load_file(file) -> pd.DataFrame:
-    if file.name.endswith(".csv"):
-        return pd.read_csv(file, low_memory=False)
-    return pd.read_excel(file)
+def get_outlier_mask(series: pd.Series):
+    clean = pd.to_numeric(series, errors="coerce")
+    q1 = clean.quantile(0.25)
+    q3 = clean.quantile(0.75)
+    iqr = q3 - q1
+    if pd.isna(iqr) or iqr == 0:
+        return pd.Series(False, index=series.index)
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    return (clean < lower) | (clean > upper)
 
 
-# ---------------------------
-# Cleaning and type inference
-# ---------------------------
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(col).strip() for col in df.columns]
-    df = df.loc[:, ~df.columns.str.contains("^Unnamed", na=False)]
+def recommend_chart_type(df, x_col, y_col, numeric_cols, categorical_cols, datetime_cols, identifier_cols):
+    """Return chart type and chart explanation."""
+    x_is_numeric = x_col in numeric_cols
+    y_is_numeric = y_col in numeric_cols if y_col else False
+    x_is_categorical = x_col in categorical_cols or x_col in identifier_cols
+    x_is_datetime = x_col in datetime_cols
 
-    # Try datetime conversion for object columns
-    for col in df.columns:
-        if df[col].dtype == "object":
-            converted = pd.to_datetime(df[col], errors="coerce")
-            success_ratio = converted.notna().mean()
-            if success_ratio >= 0.8:
-                df[col] = converted
+    unique_x = df[x_col].nunique(dropna=True)
 
-    # Try numeric conversion for remaining object columns
-    for col in df.columns:
-        if df[col].dtype == "object":
-            converted = pd.to_numeric(df[col], errors="coerce")
-            success_ratio = converted.notna().mean()
-            if success_ratio >= 0.8:
-                df[col] = converted
+    if x_is_datetime and y_is_numeric:
+        return "line", "A line chart is best for showing change over time."
 
-    return df
+    if x_is_numeric and y_is_numeric:
+        if x_col in identifier_cols:
+            return "bar_top_n", "This looks like an identifier field, so aggregated bar charts are more meaningful than a scatter plot."
+        return "scatter", "A scatter plot is best for exploring relationships, clusters, or outliers between two numeric variables."
 
+    if x_is_categorical and y_is_numeric:
+        if unique_x <= 12:
+            return "bar", "A bar chart is suitable for comparing a numeric metric across categories."
+        return "bar_top_n", "This field has many categories, so a Top N horizontal bar chart improves readability."
 
-def detect_column_profile(df: pd.DataFrame) -> dict:
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    datetime_cols = df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns.tolist()
-    categorical_cols = [c for c in df.columns if c not in numeric_cols + datetime_cols]
+    if x_is_numeric and not y_col:
+        return "histogram", "A histogram is best for understanding the distribution of a numeric variable."
 
-    low_cardinality_numeric = []
-    continuous_numeric = []
+    if x_is_categorical and not y_col:
+        if unique_x <= 6:
+            return "pie", "A pie chart can work when there are very few categories."
+        return "count_bar", "A count bar chart is better for comparing category frequencies."
 
-    for col in numeric_cols:
-        nunique = df[col].nunique(dropna=True)
-        if nunique <= 20:
-            low_cardinality_numeric.append(col)
-        else:
-            continuous_numeric.append(col)
-
-    return {
-        "numeric": numeric_cols,
-        "continuous_numeric": continuous_numeric,
-        "low_cardinality_numeric": low_cardinality_numeric,
-        "datetime": datetime_cols,
-        "categorical": categorical_cols,
-    }
+    return "bar", "A bar chart is the safest default for this selection."
 
 
-# ---------------------------
-# Filters
-# ---------------------------
-def apply_filters(df: pd.DataFrame, profile: dict) -> dict:
-    filtered_df = df.copy()
-
-    st.sidebar.header("Filters")
-
-    # categorical filters
-    for col in profile["categorical"][:5]:
-        unique_vals = filtered_df[col].dropna().astype(str).unique().tolist()
-        if 1 < len(unique_vals) <= 100:
-            selected = st.sidebar.multiselect(f"Filter {col}", sorted(unique_vals))
-            if selected:
-                filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected)]
-
-    # numeric filters
-    numeric_candidates = profile["continuous_numeric"][:3] + profile["low_cardinality_numeric"][:2]
-    for col in numeric_candidates[:5]:
-        non_null = filtered_df[col].dropna()
-        if not non_null.empty:
-            min_val = float(non_null.min())
-            max_val = float(non_null.max())
-            if np.isfinite(min_val) and np.isfinite(max_val) and min_val != max_val:
-                selected_range = st.sidebar.slider(
-                    f"Filter {col}",
-                    min_value=min_val,
-                    max_value=max_val,
-                    value=(min_val, max_val),
-                )
-                filtered_df = filtered_df[
-                    (filtered_df[col] >= selected_range[0]) &
-                    (filtered_df[col] <= selected_range[1])
-                ]
-
-    # datetime filters
-    for col in profile["datetime"][:2]:
-        non_null = filtered_df[col].dropna()
-        if not non_null.empty:
-            min_date = non_null.min().date()
-            max_date = non_null.max().date()
-            if min_date != max_date:
-                selected_dates = st.sidebar.date_input(
-                    f"Filter {col}",
-                    value=(min_date, max_date),
-                    min_value=min_date,
-                    max_value=max_date,
-                )
-                if isinstance(selected_dates, tuple) or isinstance(selected_dates, list):
-                    if len(selected_dates) == 2:
-                        start_date, end_date = selected_dates
-                        filtered_df = filtered_df[
-                            (filtered_df[col].dt.date >= start_date) &
-                            (filtered_df[col].dt.date <= end_date)
-                        ]
-
-    # options
-    with st.sidebar.expander("Analysis Options", expanded=False):
-        exclude_outliers = st.checkbox("Exclude outliers in trend charts", value=False)
-        forecast_periods = st.slider("Forecast periods", min_value=3, max_value=30, value=7)
-
-    return {
-        "df": filtered_df,
-        "exclude_outliers": exclude_outliers,
-        "forecast_periods": forecast_periods,
-    }
-
-
-# ---------------------------
-# KPI section
-# ---------------------------
-def compute_aggregation(df: pd.DataFrame, metric_col: str, agg_type: str):
-    if metric_col not in df.columns:
-        return None
-
-    series = df[metric_col].dropna()
-    if series.empty:
-        return None
-
-    if agg_type == "sum":
-        return series.sum()
-    if agg_type == "mean":
-        return series.mean()
-    if agg_type == "median":
-        return series.median()
-    if agg_type == "count":
-        return series.count()
-    if agg_type == "min":
-        return series.min()
-    if agg_type == "max":
-        return series.max()
-    return None
-
-
-def create_kpis(df: pd.DataFrame, profile: dict):
-    c1, c2, c3 = st.columns(3)
-
-    total_rows = len(df)
-    total_cols = df.shape[1]
-    missing_vals = int(df.isnull().sum().sum())
-
-    c1.metric("Rows", format_compact_number(total_rows))
-    c2.metric("Columns", format_compact_number(total_cols))
-    c3.metric("Missing Values", format_compact_number(missing_vals))
-
-    st.caption(
-        f"Rows: {format_full_number(total_rows, 0)} | "
-        f"Columns: {format_full_number(total_cols, 0)} | "
-        f"Missing Values: {format_full_number(missing_vals, 0)}"
-    )
-
-    if profile["numeric"]:
-        st.markdown("### Custom Metric")
-        m1, m2, m3 = st.columns(3)
-
-        metric_col = m1.selectbox("Choose numeric column", profile["numeric"])
-        agg_type = m2.selectbox("Choose aggregation", ["sum", "mean", "median", "count", "min", "max"])
-        metric_value = compute_aggregation(df, metric_col, agg_type)
-
-        m3.metric(f"{agg_type.title()} of {metric_col}", format_compact_number(metric_value))
-        st.caption(f"Exact value: {format_full_number(metric_value, 2) if metric_value is not None else 'N/A'}")
-
-
-# ---------------------------
-# Smart charting
-# ---------------------------
-def classify_single_column(col: str, profile: dict) -> str:
-    if col in profile["datetime"]:
-        return "datetime"
-    if col in profile["numeric"]:
-        return "numeric"
-    return "categorical"
-
-
-def recommend_chart(x_col: str, y_col: str | None, profile: dict) -> str:
-    x_type = classify_single_column(x_col, profile)
-    y_type = None if y_col is None else classify_single_column(y_col, profile)
-
-    if y_col is None:
-        if x_type == "numeric":
-            if x_col in profile["low_cardinality_numeric"]:
-                return "count_bar"
-            return "histogram"
-        return "count_bar"
-
-    if x_type == "datetime" and y_type == "numeric":
-        return "line"
-    if x_type == "categorical" and y_type == "numeric":
-        return "bar"
-    if x_type == "numeric" and y_type == "numeric":
-        return "scatter"
-    if x_type == "categorical" and y_type == "categorical":
-        return "heatmap_table"
-
-    return "bar"
-
-
-def build_chart(df: pd.DataFrame, x_col: str, y_col: str | None, chart_type: str):
-    if chart_type == "histogram":
-        fig = px.histogram(df, x=x_col, nbins=30, title=f"Distribution of {x_col}")
-        caption = f"This histogram shows the distribution of values in '{x_col}'."
-        return fig, caption
-
-    if chart_type == "count_bar":
-        counts = df[x_col].astype(str).value_counts().head(20).reset_index()
-        counts.columns = [x_col, "Count"]
-        fig = px.bar(counts, x=x_col, y="Count", title=f"Count of {x_col}")
-        fig.update_xaxes(type="category")
-        caption = f"This bar chart shows the frequency of the most common values in '{x_col}'."
-        return fig, caption
+def build_chart(df, x_col, y_col, chart_type, top_n=10):
+    chart_df = df.copy()
 
     if chart_type == "line":
-        temp = df[[x_col, y_col]].dropna().sort_values(x_col)
-        if temp.empty:
-            return None, "No valid data available for line chart."
-        grouped = temp.groupby(x_col, as_index=False)[y_col].sum()
-        fig = px.line(grouped, x=x_col, y=y_col, title=f"{y_col} over {x_col}")
-        caption = f"This line chart shows how '{y_col}' changes over time using '{x_col}'."
-        return fig, caption
+        chart_df = chart_df[[x_col, y_col]].dropna().sort_values(by=x_col)
+        fig = px.line(chart_df, x=x_col, y=y_col, title=f"{y_col} over {x_col}")
+        return fig
+
+    if chart_type == "scatter":
+        chart_df = chart_df[[x_col, y_col]].dropna()
+        fig = px.scatter(chart_df, x=x_col, y=y_col, title=f"{x_col} vs {y_col}", opacity=0.7)
+        return fig
 
     if chart_type == "bar":
-        temp = df[[x_col, y_col]].dropna()
-        if temp.empty:
-            return None, "No valid data available for bar chart."
-        grouped = temp.groupby(x_col, as_index=False)[y_col].sum().sort_values(y_col, ascending=False).head(20)
-        grouped[x_col] = grouped[x_col].astype(str)
+        grouped = (
+            chart_df[[x_col, y_col]]
+            .dropna()
+            .groupby(x_col, as_index=False)[y_col]
+            .sum()
+            .sort_values(by=y_col, ascending=False)
+        )
+        fig = px.bar(grouped, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
+        return fig
+
+    if chart_type == "bar_top_n":
+        grouped = (
+            chart_df[[x_col, y_col]]
+            .dropna()
+            .groupby(x_col, as_index=False)[y_col]
+            .sum()
+            .sort_values(by=y_col, ascending=False)
+            .head(top_n)
+            .sort_values(by=y_col, ascending=True)
+        )
         fig = px.bar(
-            grouped.sort_values(y_col, ascending=True),
+            grouped,
             x=y_col,
             y=x_col,
             orientation="h",
-            title=f"{y_col} by {x_col}",
+            title=f"Top {top_n} {x_col} by {y_col}"
         )
-        caption = f"This horizontal bar chart compares aggregated '{y_col}' values across '{x_col}'."
-        return fig, caption
+        return fig
 
-    if chart_type == "scatter":
-        temp = df[[x_col, y_col]].dropna()
-        if temp.empty:
-            return None, "No valid data available for scatter plot."
-        fig = px.scatter(temp, x=x_col, y=y_col, opacity=0.6, title=f"{x_col} vs {y_col}")
-        caption = f"This scatter plot compares '{x_col}' and '{y_col}' to reveal relationships or outliers."
-        return fig, caption
+    if chart_type == "histogram":
+        chart_df = chart_df[[x_col]].dropna()
+        fig = px.histogram(chart_df, x=x_col, nbins=30, title=f"Distribution of {x_col}")
+        return fig
 
-    if chart_type == "heatmap_table":
-        temp = df[[x_col, y_col]].dropna().copy()
-        if temp.empty:
-            return None, "No valid data available for categorical heatmap."
-        pivot = pd.crosstab(temp[x_col].astype(str), temp[y_col].astype(str))
-        fig = go.Figure(
-            data=go.Heatmap(
-                z=pivot.values,
-                x=pivot.columns,
-                y=pivot.index,
-                colorscale="Blues",
-            )
-        )
-        fig.update_layout(title=f"{x_col} vs {y_col}")
-        caption = f"This heatmap shows how '{x_col}' and '{y_col}' categories intersect."
-        return fig, caption
+    if chart_type == "pie":
+        counts = chart_df[x_col].value_counts(dropna=False).reset_index()
+        counts.columns = [x_col, "count"]
+        fig = px.pie(counts, names=x_col, values="count", title=f"{x_col} distribution")
+        return fig
 
-    return None, "Could not determine a suitable chart type."
+    if chart_type == "count_bar":
+        counts = chart_df[x_col].value_counts(dropna=False).head(15).reset_index()
+        counts.columns = [x_col, "count"]
+        fig = px.bar(counts, x=x_col, y="count", title=f"Top categories in {x_col}")
+        return fig
+
+    # fallback
+    fig = px.bar(title="No chart available")
+    return fig
 
 
-def build_forecast_chart(df: pd.DataFrame, datetime_col: str, numeric_col: str, exclude_outliers: bool, forecast_periods: int):
-    temp = df[[datetime_col, numeric_col]].dropna().copy()
-    if temp.empty:
-        return None, "No valid rows available for forecasting."
+def moving_average_projection(df, date_col, value_col, window=7, projection_points=8):
+    """Simple moving average projection."""
+    ts = df[[date_col, value_col]].dropna().copy()
+    ts = ts.sort_values(date_col)
+    ts[value_col] = pd.to_numeric(ts[value_col], errors="coerce")
+    ts = ts.dropna()
 
-    temp = temp.sort_values(datetime_col)
-    temp["date"] = temp[datetime_col].dt.date
-    grouped = temp.groupby("date", as_index=False)[numeric_col].sum()
-    grouped["date"] = pd.to_datetime(grouped["date"])
+    if ts.empty or len(ts) < 5:
+        return None
 
-    if exclude_outliers and len(grouped) >= 5:
-        q1 = grouped[numeric_col].quantile(0.25)
-        q3 = grouped[numeric_col].quantile(0.75)
-        iqr = q3 - q1
-        upper = q3 + 1.5 * iqr
-        grouped = grouped[grouped[numeric_col] <= upper].copy()
+    grouped = ts.groupby(date_col, as_index=False)[value_col].sum()
+    grouped["moving_avg"] = grouped[value_col].rolling(window=min(window, len(grouped)), min_periods=1).mean()
 
-    fig = px.line(grouped, x="date", y=numeric_col, title=f"{numeric_col} Trend Over Time")
+    last_date = grouped[date_col].max()
+    inferred_freq = pd.infer_freq(grouped[date_col].sort_values())
 
-    if len(grouped) >= 2:
-        x = np.arange(len(grouped))
-        y = grouped[numeric_col].values
-        slope, intercept = np.polyfit(x, y, 1)
-        future_x = np.arange(len(grouped) + forecast_periods)
-        future_y = intercept + slope * future_x
-        future_dates = pd.date_range(start=grouped["date"].iloc[0], periods=len(grouped) + forecast_periods, freq="D")
+    if inferred_freq is None:
+        date_diffs = grouped[date_col].sort_values().diff().dropna()
+        if not date_diffs.empty:
+            avg_diff = date_diffs.mode().iloc[0]
+        else:
+            avg_diff = pd.Timedelta(days=1)
+        future_dates = [last_date + avg_diff * (i + 1) for i in range(projection_points)]
+    else:
+        future_dates = pd.date_range(
+            start=last_date,
+            periods=projection_points + 1,
+            freq=inferred_freq
+        )[1:]
 
-        fig.add_trace(
-            go.Scatter(
-                x=future_dates,
-                y=future_y,
-                mode="lines",
-                name="Forecast Trend",
-                line=dict(dash="dash"),
-            )
-        )
+    last_ma = grouped["moving_avg"].iloc[-1]
+    forecast_df = pd.DataFrame({
+        date_col: future_dates,
+        value_col: [last_ma] * len(future_dates),
+        "series_type": ["Projection"] * len(future_dates)
+    })
 
-    caption = "This trend view includes a simple forecast extension based on the detected datetime and numeric columns."
-    return fig, caption
+    actual_df = grouped.copy()
+    actual_df["series_type"] = "Actual"
+
+    combined = pd.concat([actual_df[[date_col, value_col, "series_type"]], forecast_df], ignore_index=True)
+    return combined
 
 
-def create_correlation_heatmap(df: pd.DataFrame, numeric_cols: list[str]):
+def strongest_correlations(df, numeric_cols):
     if len(numeric_cols) < 2:
-        return None, "At least two numeric columns are required for correlation analysis."
+        return []
 
-    corr = df[numeric_cols].corr()
+    corr = df[numeric_cols].corr(numeric_only=True)
+    pairs = []
 
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=corr.values,
-            x=corr.columns,
-            y=corr.index,
-            colorscale="RdBu",
-            zmin=-1,
-            zmax=1,
-            text=np.round(corr.values, 2),
-            texttemplate="%{text}",
-            colorbar=dict(title="Correlation"),
-        )
-    )
-    fig.update_layout(title="Interactive Correlation Heatmap", height=700)
+    for i in range(len(corr.columns)):
+        for j in range(i + 1, len(corr.columns)):
+            col1, col2 = corr.columns[i], corr.columns[j]
+            val = corr.iloc[i, j]
+            if pd.notna(val):
+                pairs.append((col1, col2, val))
 
-    caption = "This heatmap shows how strongly numeric variables are related to each other."
-    return fig, caption
+    pairs_sorted = sorted(pairs, key=lambda x: abs(x[2]), reverse=True)
+    return pairs_sorted[:5]
 
 
-# ---------------------------
-# Insights
-# ---------------------------
-def generate_insights(df: pd.DataFrame, profile: dict) -> list[str]:
+def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
     insights = []
 
-    insights.append(f"The dataset contains {len(df):,} rows and {df.shape[1]} columns.")
-    insights.append(f"There are {int(df.isnull().sum().sum()):,} missing values in the filtered dataset.")
+    if numeric_cols:
+        for col in numeric_cols[:3]:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            if not s.empty:
+                insights.append(
+                    f"'{col}' has a mean of {s.mean():.2f}, median of {s.median():.2f}, and standard deviation of {s.std():.2f}."
+                )
 
-    if profile["numeric"]:
-        most_missing_num = df[profile["numeric"]].isnull().sum().sort_values(ascending=False)
-        if not most_missing_num.empty:
-            insights.append(
-                f"The numeric column with the most missing values is '{most_missing_num.index[0]}' with {int(most_missing_num.iloc[0]):,} missing entries."
-            )
+                outlier_mask = get_outlier_mask(s)
+                outlier_count = int(outlier_mask.sum()) if hasattr(outlier_mask, "sum") else 0
+                if len(s) > 0 and outlier_count > 0:
+                    outlier_pct = outlier_count / len(s) * 100
+                    insights.append(
+                        f"'{col}' contains approximately {outlier_count} potential outliers ({outlier_pct:.1f}% of non-null values)."
+                    )
 
-        variance_series = df[profile["numeric"]].std(numeric_only=True).sort_values(ascending=False)
-        if not variance_series.empty:
-            insights.append(
-                f"The most variable numeric column is '{variance_series.index[0]}', suggesting it has the widest spread of values."
-            )
+    if categorical_cols:
+        for col in categorical_cols[:2]:
+            vc = df[col].astype(str).value_counts(dropna=False)
+            if not vc.empty:
+                top_cat = vc.index[0]
+                top_count = vc.iloc[0]
+                insights.append(
+                    f"The most frequent value in '{col}' is '{top_cat}', appearing {top_count:,} times."
+                )
 
-    if profile["categorical"]:
-        cat_col = profile["categorical"][0]
-        top_vals = df[cat_col].astype(str).value_counts().head(3)
-        if not top_vals.empty:
-            text = ", ".join([f"{idx} ({val})" for idx, val in top_vals.items()])
-            insights.append(f"The most common values in '{cat_col}' are {text}.")
+    if datetime_cols and numeric_cols:
+        date_col = datetime_cols[0]
+        metric_col = numeric_cols[0]
+        temp = df[[date_col, metric_col]].dropna().copy()
+        temp[metric_col] = pd.to_numeric(temp[metric_col], errors="coerce")
+        temp = temp.dropna()
+        if not temp.empty:
+            trend = temp.groupby(date_col, as_index=False)[metric_col].sum().sort_values(date_col)
+            if len(trend) >= 2:
+                first_val = trend[metric_col].iloc[0]
+                last_val = trend[metric_col].iloc[-1]
+                direction = "increased" if last_val > first_val else "decreased"
+                insights.append(
+                    f"Over the observed time range, '{metric_col}' generally {direction} from {first_val:.2f} to {last_val:.2f}."
+                )
 
-    if len(profile["numeric"]) >= 2:
-        corr = df[profile["numeric"]].corr().abs().unstack().reset_index()
-        corr.columns = ["A", "B", "Corr"]
-        corr = corr[corr["A"] != corr["B"]]
-        corr["pair"] = corr.apply(lambda r: tuple(sorted([r["A"], r["B"]])), axis=1)
-        corr = corr.drop_duplicates("pair")
-        corr = corr[corr["Corr"] < 0.99]
-        if not corr.empty:
-            top_corr = corr.sort_values("Corr", ascending=False).iloc[0]
-            insights.append(
-                f"The strongest non-trivial numeric relationship is between '{top_corr['A']}' and '{top_corr['B']}' with correlation {top_corr['Corr']:.2f}."
-            )
+                peak_row = trend.loc[trend[metric_col].idxmax()]
+                insights.append(
+                    f"The peak value of '{metric_col}' occurred on {peak_row[date_col]} with a total of {peak_row[metric_col]:.2f}."
+                )
 
-    if profile["datetime"]:
-        insights.append("Datetime columns were detected, so time-based trend and forecast analysis is available.")
+    top_corrs = strongest_correlations(df, numeric_cols)
+    if top_corrs:
+        col1, col2, corr_val = top_corrs[0]
+        strength = "strong" if abs(corr_val) >= 0.7 else "moderate" if abs(corr_val) >= 0.4 else "weak"
+        direction = "positive" if corr_val > 0 else "negative"
+        insights.append(
+            f"The strongest detected numeric relationship is a {strength} {direction} correlation between '{col1}' and '{col2}' ({corr_val:.2f})."
+        )
 
     return insights
 
 
-def generate_summary(df: pd.DataFrame, profile: dict, insights: list[str]) -> str:
-    summary = []
-    summary.append(
-        "This dashboard automatically profiles the uploaded dataset and converts it into interactive metrics, visualizations, and exploratory insights."
-    )
-
-    if profile["numeric"]:
-        summary.append(
-            f"The dataset contains {len(profile['numeric'])} numeric columns, enabling aggregation, distribution analysis, and relationship detection."
-        )
-
-    if profile["datetime"]:
-        summary.append(
-            "Datetime fields are present, which means the dashboard can support time-based trend analysis and simple forecasting."
-        )
-
-    if profile["categorical"]:
-        summary.append(
-            "Categorical fields are available for segmentation and comparison, making it possible to explore frequency patterns and grouped performance."
-        )
-
-    summary.append(
-        "The most useful next step is to focus on the highest-variance variables, strongest correlations, and any trend anomalies that may deserve closer investigation."
-    )
-
-    return " ".join(summary)
+def df_to_csv_download(df):
+    return df.to_csv(index=False).encode("utf-8")
 
 
-# ---------------------------
-# Main App
-# ---------------------------
+def text_download(insights):
+    buffer = io.StringIO()
+    buffer.write("AI Analyst Copilot Dashboard - Generated Insights\n")
+    buffer.write("=" * 55 + "\n\n")
+    for i, insight in enumerate(insights, start=1):
+        buffer.write(f"{i}. {insight}\n")
+    return buffer.getvalue().encode("utf-8")
+
+
+# =========================
+# Title
+# =========================
 st.title("AI Analyst Copilot Dashboard")
-st.subheader("Upload a CSV or Excel file and get business-focused analysis")
-st.markdown("### Turn raw data into actionable business insights instantly.")
-st.caption("Upload a CSV or Excel file to explore KPIs, trends, chart recommendations, and automated insights.")
+st.caption("Upload a CSV or Excel file and get business-focused analysis.")
+st.write("Turn raw data into actionable business insights instantly.")
 
 uploaded_file = st.file_uploader("Upload your file", type=["csv", "xlsx"])
 
 if uploaded_file is not None:
+    # =========================
+    # Load Data
+    # =========================
     try:
-        st.caption("Tip: Upload structured business, sales, operations, HR, finance, survey, or analytics data for best results.")
+        if uploaded_file.name.endswith(".csv"):
+            raw_df = pd.read_csv(uploaded_file)
+        else:
+            raw_df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"Could not read the file. Error: {e}")
+        st.stop()
 
-        with st.spinner("Analyzing data..."):
-            df = load_file(uploaded_file)
-            df = clean_data(df)
-            profile = detect_column_profile(df)
-            filter_result = apply_filters(df, profile)
-            df = filter_result["df"]
-            exclude_outliers = filter_result["exclude_outliers"]
-            forecast_periods = filter_result["forecast_periods"]
-            profile = detect_column_profile(df)
+    if raw_df.empty:
+        st.warning("The uploaded file is empty.")
+        st.stop()
 
-        if df.empty:
-            st.warning("No data available after applying filters.")
+    raw_df.columns = [normalize_column_name(col) for col in raw_df.columns]
+
+    df, numeric_cols, categorical_cols, datetime_cols, identifier_cols = detect_column_types(raw_df)
+
+    st.success("File uploaded successfully.")
+    st.info("The app has automatically detected column types and enabled dynamic analysis for your dataset.")
+
+    # =========================
+    # Sidebar Filters
+    # =========================
+    st.sidebar.header("Filters")
+
+    filtered_df = df.copy()
+
+    with st.sidebar.expander("Time Filters", expanded=True):
+        for col in datetime_cols:
+            series = filtered_df[col].dropna()
+            if not series.empty:
+                min_date = series.min().date()
+                max_date = series.max().date()
+                selected_range = st.date_input(
+                    f"Filter {col}",
+                    value=(min_date, max_date),
+                    key=f"time_{col}"
+                )
+                if isinstance(selected_range, tuple) and len(selected_range) == 2:
+                    start_date, end_date = selected_range
+                    filtered_df = filtered_df[
+                        filtered_df[col].dt.date.between(start_date, end_date)
+                    ]
+
+    with st.sidebar.expander("Categorical Filters", expanded=True):
+        for col in categorical_cols[:12]:
+            options = sorted(filtered_df[col].dropna().astype(str).unique().tolist())
+            if 0 < len(options) <= 100:
+                selected = st.multiselect(f"Filter {col}", options=options, key=f"cat_{col}")
+                if selected:
+                    filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected)]
+
+    with st.sidebar.expander("Numeric Filters", expanded=False):
+        for col in numeric_cols[:10]:
+            series = pd.to_numeric(filtered_df[col], errors="coerce").dropna()
+            if not series.empty:
+                min_val = float(series.min())
+                max_val = float(series.max())
+                if min_val != max_val:
+                    selected_range = st.slider(
+                        f"Filter {col}",
+                        min_value=min_val,
+                        max_value=max_val,
+                        value=(min_val, max_val),
+                        key=f"num_{col}"
+                    )
+                    filtered_df = filtered_df[
+                        pd.to_numeric(filtered_df[col], errors="coerce").between(selected_range[0], selected_range[1])
+                    ]
+
+    with st.sidebar.expander("Analysis Options", expanded=False):
+        remove_outliers = st.checkbox("Exclude outliers from charts", value=False)
+        show_data_preview = st.checkbox("Show filtered data preview", value=True)
+        top_n = st.slider("Top N for high-cardinality charts", min_value=5, max_value=25, value=10)
+
+    if remove_outliers and numeric_cols:
+        for col in numeric_cols:
+            mask = get_outlier_mask(filtered_df[col])
+            filtered_df = filtered_df[~mask]
+
+    # =========================
+    # KPI Cards
+    # =========================
+    row_count = len(filtered_df)
+    col_count = filtered_df.shape[1]
+    missing_count = int(filtered_df.isna().sum().sum())
+    duplicate_count = int(filtered_df.duplicated().sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", f"{row_count:,}")
+    c2.metric("Columns", f"{col_count:,}")
+    c3.metric("Missing Values", f"{missing_count:,}")
+    c4.metric("Duplicate Rows", f"{duplicate_count:,}")
+
+    st.caption(
+        f"Rows: {row_count:,} | Columns: {col_count:,} | Missing Values: {missing_count:,} | Duplicate Rows: {duplicate_count:,}"
+    )
+
+    # =========================
+    # Data Quality Summary
+    # =========================
+    with st.expander("Data Quality Summary", expanded=False):
+        quality_df = pd.DataFrame({
+            "column": filtered_df.columns,
+            "dtype": [str(filtered_df[col].dtype) for col in filtered_df.columns],
+            "missing_values": [int(filtered_df[col].isna().sum()) for col in filtered_df.columns],
+            "missing_pct": [round(filtered_df[col].isna().mean() * 100, 2) for col in filtered_df.columns],
+            "unique_values": [int(filtered_df[col].nunique(dropna=True)) for col in filtered_df.columns]
+        })
+        st.dataframe(quality_df, use_container_width=True)
+
+        st.write("**Detected Column Groups**")
+        st.write(f"- Numeric measure columns: {numeric_cols if numeric_cols else 'None'}")
+        st.write(f"- Categorical columns: {categorical_cols if categorical_cols else 'None'}")
+        st.write(f"- Datetime columns: {datetime_cols if datetime_cols else 'None'}")
+        st.write(f"- Identifier-like columns: {identifier_cols if identifier_cols else 'None'}")
+
+    # =========================
+    # Custom Metric
+    # =========================
+    st.subheader("Custom Metric")
+
+    if numeric_cols:
+        m1, m2 = st.columns([2, 1])
+        selected_metric_col = m1.selectbox("Choose numeric column", numeric_cols)
+        selected_agg = m2.selectbox("Choose aggregation", ["sum", "mean", "median", "min", "max", "count", "std"])
+
+        metric_value = compute_metric(filtered_df[selected_metric_col], selected_agg)
+        metric_label = f"{selected_agg.title()} of {selected_metric_col}"
+        st.metric(metric_label, format_number(metric_value))
+        st.caption(f"Exact value: {metric_value}")
+    else:
+        st.warning("No numeric measure columns detected for custom metrics.")
+
+    # =========================
+    # Tabs
+    # =========================
+    tabs = st.tabs([
+        "Overview",
+        "Visual Explorer",
+        "Forecast & Trends",
+        "Insights",
+        "Downloads"
+    ])
+
+    # -------------------------
+    # Overview
+    # -------------------------
+    with tabs[0]:
+        st.subheader("Dataset Overview")
+
+        if show_data_preview:
+            st.dataframe(filtered_df.head(20), use_container_width=True)
+
+        left, right = st.columns(2)
+
+        with left:
+            if numeric_cols:
+                selected_hist_col = st.selectbox("Numeric distribution", numeric_cols, key="overview_hist")
+                hist_fig = px.histogram(filtered_df, x=selected_hist_col, nbins=30, title=f"Distribution of {selected_hist_col}")
+                st.plotly_chart(hist_fig, use_container_width=True)
+
+        with right:
+            target_cat_cols = categorical_cols if categorical_cols else identifier_cols
+            if target_cat_cols:
+                selected_cat_col = st.selectbox("Category frequency", target_cat_cols, key="overview_cat")
+                counts = filtered_df[selected_cat_col].astype(str).value_counts().head(top_n).reset_index()
+                counts.columns = [selected_cat_col, "count"]
+                count_fig = px.bar(
+                    counts.sort_values("count", ascending=True),
+                    x="count",
+                    y=selected_cat_col,
+                    orientation="h",
+                    title=f"Top {top_n} values in {selected_cat_col}"
+                )
+                st.plotly_chart(count_fig, use_container_width=True)
+
+    # -------------------------
+    # Visual Explorer
+    # -------------------------
+    with tabs[1]:
+        st.subheader("Smart Chart Builder")
+
+        all_x_options = categorical_cols + datetime_cols + identifier_cols + numeric_cols
+        all_x_options = list(dict.fromkeys(all_x_options))  # remove duplicates while preserving order
+
+        if all_x_options:
+            x_col = st.selectbox("Select X-axis / grouping column", all_x_options)
+        else:
+            st.warning("No usable columns found for charting.")
             st.stop()
 
-        st.success("File uploaded successfully")
-        st.info("The app has automatically detected column types and enabled dynamic analysis for your dataset.")
+        y_options = ["<None>"] + numeric_cols
+        y_choice = st.selectbox("Select Y-axis / metric column", y_options)
+        y_col = None if y_choice == "<None>" else y_choice
 
-        create_kpis(df, profile)
-
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(
-            ["Overview", "Visual Explorer", "Forecast & Trends", "Insights", "Downloads"]
+        chart_type, chart_reason = recommend_chart_type(
+            filtered_df, x_col, y_col, numeric_cols, categorical_cols, datetime_cols, identifier_cols
         )
 
-        with tab1:
-            st.subheader("Dataset Preview")
-            st.dataframe(df.head(10), use_container_width=True)
+        st.write(f"**Recommended chart type:** {chart_type.replace('_', ' ').title()}")
+        st.caption(chart_reason)
 
-            st.subheader("Column Information")
-            info_df = pd.DataFrame({
-                "Column": df.columns,
-                "Data Type": [str(dtype) for dtype in df.dtypes],
-                "Missing Values": df.isnull().sum().values,
-                "Unique Values": df.nunique().values,
-            })
-            st.dataframe(info_df, use_container_width=True)
+        try:
+            fig = build_chart(filtered_df, x_col, y_col, chart_type, top_n=top_n)
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Could not build chart: {e}")
 
-            st.subheader("Summary Statistics")
-            if profile["numeric"]:
-                st.dataframe(df[profile["numeric"]].describe().T, use_container_width=True)
-            else:
-                st.warning("No numeric columns found in this dataset.")
+    # -------------------------
+    # Forecast & Trends
+    # -------------------------
+    with tabs[2]:
+        st.subheader("Forecast & Trends")
 
-        with tab2:
-            st.subheader("Smart Chart Builder")
+        if datetime_cols and numeric_cols:
+            date_col = st.selectbox("Select datetime column", datetime_cols, key="trend_date")
+            value_col = st.selectbox("Select numeric column for trend/projection", numeric_cols, key="trend_value")
+            ma_window = st.slider("Moving average window", min_value=3, max_value=30, value=7)
 
-            all_cols = df.columns.tolist()
-            x_col = st.selectbox("Select X-axis / grouping column", all_cols)
-            y_options = ["None"] + all_cols
-            y_choice = st.selectbox("Select Y-axis / metric column", y_options)
-            y_col = None if y_choice == "None" else y_choice
+            projection_df = moving_average_projection(filtered_df, date_col, value_col, window=ma_window)
 
-            recommended_chart = recommend_chart(x_col, y_col, profile)
-            st.caption(f"Recommended chart type: **{recommended_chart.replace('_', ' ').title()}**")
-
-            fig, caption = build_chart(df, x_col, y_col, recommended_chart)
-            if fig is not None:
-                st.plotly_chart(fig, use_container_width=True)
-            st.caption(caption)
-
-            if len(profile["numeric"]) >= 2:
-                st.subheader("Correlation Heatmap")
-                heatmap_fig, heatmap_caption = create_correlation_heatmap(df, profile["numeric"])
-                if heatmap_fig is not None:
-                    st.plotly_chart(heatmap_fig, use_container_width=True)
-                st.caption(heatmap_caption)
-
-        with tab3:
-            st.subheader("Forecast & Trends")
-            if profile["datetime"] and profile["numeric"]:
-                dt_col = st.selectbox("Select datetime column", profile["datetime"])
-                num_col = st.selectbox("Select numeric column for forecasting", profile["numeric"])
-
-                trend_fig, trend_caption = build_forecast_chart(
-                    df,
-                    dt_col,
-                    num_col,
-                    exclude_outliers,
-                    forecast_periods,
+            if projection_df is not None:
+                trend_fig = px.line(
+                    projection_df,
+                    x=date_col,
+                    y=value_col,
+                    color="series_type",
+                    title=f"{value_col} Trend and Projection"
                 )
-                if trend_fig is not None:
-                    st.plotly_chart(trend_fig, use_container_width=True)
-                st.caption(trend_caption)
+                st.plotly_chart(trend_fig, use_container_width=True)
+                st.caption(
+                    "This trend view includes a simple moving-average projection. "
+                    "It is useful for directional planning, not for high-stakes forecasting."
+                )
             else:
-                st.info("No valid datetime + numeric combination was detected for forecasting.")
+                st.warning("Not enough time-series data to create a projection.")
+        else:
+            st.info("A trend/projection view requires at least one datetime column and one numeric measure column.")
 
-        with tab4:
-            st.subheader("Key Dataset Insights")
-            insights = generate_insights(df, profile)
-            for insight in insights:
-                st.write(f"- {insight}")
+    # -------------------------
+    # Insights
+    # -------------------------
+    with tabs[3]:
+        st.subheader("Business Insights")
 
-            st.subheader("Executive Summary")
-            summary = generate_summary(df, profile, insights)
-            st.text_area("Summary", summary, height=220)
+        generated_insights = generate_insights(filtered_df, numeric_cols, categorical_cols, datetime_cols)
 
-        with tab5:
-            st.subheader("Download Outputs")
-            cleaned_csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="Download Cleaned Data as CSV",
-                data=cleaned_csv,
-                file_name="cleaned_data.csv",
-                mime="text/csv",
-            )
+        if generated_insights:
+            for idx, insight in enumerate(generated_insights, start=1):
+                st.info(f"{idx}. {insight}")
+        else:
+            st.warning("Not enough data to generate insights.")
 
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
+        if numeric_cols:
+            st.markdown("### Correlation Heatmap")
+            if len(numeric_cols) >= 2:
+                corr = filtered_df[numeric_cols].corr(numeric_only=True)
+                heatmap_fig = px.imshow(
+                    corr,
+                    text_auto=".2f",
+                    aspect="auto",
+                    title="Interactive Correlation Heatmap"
+                )
+                st.plotly_chart(heatmap_fig, use_container_width=True)
+                st.caption("This heatmap shows how strongly numeric variables are related to each other.")
+            else:
+                st.info("Need at least two numeric columns for correlation analysis.")
+
+        if numeric_cols:
+            st.markdown("### Outlier Check")
+            outlier_col = st.selectbox("Choose numeric column for outlier analysis", numeric_cols, key="outlier_col")
+            outlier_mask = get_outlier_mask(filtered_df[outlier_col])
+            outlier_count = int(outlier_mask.sum())
+            non_null_count = int(pd.to_numeric(filtered_df[outlier_col], errors="coerce").notna().sum())
+            outlier_pct = (outlier_count / non_null_count * 100) if non_null_count > 0 else 0
+
+            oc1, oc2 = st.columns(2)
+            oc1.metric("Potential Outliers", f"{outlier_count:,}")
+            oc2.metric("Outlier %", f"{outlier_pct:.2f}%")
+
+            box_fig = px.box(filtered_df, y=outlier_col, title=f"Box Plot of {outlier_col}")
+            st.plotly_chart(box_fig, use_container_width=True)
+
+    # -------------------------
+    # Downloads
+    # -------------------------
+    with tabs[4]:
+        st.subheader("Downloads")
+
+        generated_insights = generate_insights(filtered_df, numeric_cols, categorical_cols, datetime_cols)
+
+        st.download_button(
+            label="Download Filtered Data (CSV)",
+            data=df_to_csv_download(filtered_df),
+            file_name="filtered_data.csv",
+            mime="text/csv"
+        )
+
+        st.download_button(
+            label="Download Generated Insights (TXT)",
+            data=text_download(generated_insights),
+            file_name="generated_insights.txt",
+            mime="text/plain"
+        )
+
+        st.write("You can use these exports for reporting, portfolio demos, or sharing analysis outputs.")
 
 else:
-    st.info("Please upload a CSV or Excel file to begin.")
+    st.info("Upload a CSV or Excel file to explore KPIs, trends, chart recommendations, and automated insights.")

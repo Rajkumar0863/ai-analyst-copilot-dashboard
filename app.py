@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
 
 st.set_page_config(
     page_title="AI Analyst Copilot Dashboard",
@@ -17,12 +16,11 @@ st.set_page_config(
 # =========================
 ID_KEYWORDS = [
     "id", "order_id", "product_id", "customer_id", "invoice", "transaction_id",
-    "user_id", "record_id", "item_id", "code", "sku"
+    "user_id", "record_id", "item_id", "code", "sku", "empid", "employeeid"
 ]
 
 
 def safe_to_datetime(series: pd.Series) -> pd.Series:
-    """Try converting a series to datetime safely."""
     try:
         converted = pd.to_datetime(series, errors="coerce")
         valid_ratio = converted.notna().mean()
@@ -36,7 +34,6 @@ def normalize_column_name(col: str) -> str:
 
 
 def detect_column_types(df: pd.DataFrame):
-    """Detect numeric, categorical, datetime, and identifier-like columns."""
     temp_df = df.copy()
     temp_df.columns = [str(c) for c in temp_df.columns]
 
@@ -57,12 +54,10 @@ def detect_column_types(df: pd.DataFrame):
     for col in all_cols:
         col_lower = col.lower().strip()
 
-        # Rule 1: name suggests ID
         if any(keyword in col_lower for keyword in ID_KEYWORDS):
             identifier_cols.append(col)
             continue
 
-        # Rule 2: high uniqueness in integer/numeric column often means identifier
         if col in numeric_cols:
             nunique_ratio = temp_df[col].nunique(dropna=True) / max(len(temp_df), 1)
             if nunique_ratio > 0.85:
@@ -80,11 +75,9 @@ def detect_column_types(df: pd.DataFrame):
 def format_number(value):
     if pd.isna(value):
         return "N/A"
-    if abs(value) >= 1_000_000:
+    if isinstance(value, (int, float, np.number)):
         return f"{value:,.2f}"
-    if abs(value) >= 1_000:
-        return f"{value:,.2f}"
-    return f"{value:.2f}" if isinstance(value, (int, float, np.number)) else str(value)
+    return str(value)
 
 
 def compute_metric(series: pd.Series, agg: str):
@@ -122,12 +115,10 @@ def get_outlier_mask(series: pd.Series):
 
 
 def recommend_chart_type(df, x_col, y_col, numeric_cols, categorical_cols, datetime_cols, identifier_cols):
-    """Return chart type and chart explanation."""
     x_is_numeric = x_col in numeric_cols
     y_is_numeric = y_col in numeric_cols if y_col else False
     x_is_categorical = x_col in categorical_cols or x_col in identifier_cols
     x_is_datetime = x_col in datetime_cols
-
     unique_x = df[x_col].nunique(dropna=True)
 
     if x_is_datetime and y_is_numeric:
@@ -159,13 +150,11 @@ def build_chart(df, x_col, y_col, chart_type, top_n=10):
 
     if chart_type == "line":
         chart_df = chart_df[[x_col, y_col]].dropna().sort_values(by=x_col)
-        fig = px.line(chart_df, x=x_col, y=y_col, title=f"{y_col} over {x_col}")
-        return fig
+        return px.line(chart_df, x=x_col, y=y_col, title=f"{y_col} over {x_col}")
 
     if chart_type == "scatter":
         chart_df = chart_df[[x_col, y_col]].dropna()
-        fig = px.scatter(chart_df, x=x_col, y=y_col, title=f"{x_col} vs {y_col}", opacity=0.7)
-        return fig
+        return px.scatter(chart_df, x=x_col, y=y_col, title=f"{x_col} vs {y_col}", opacity=0.7)
 
     if chart_type == "bar":
         grouped = (
@@ -175,8 +164,7 @@ def build_chart(df, x_col, y_col, chart_type, top_n=10):
             .sum()
             .sort_values(by=y_col, ascending=False)
         )
-        fig = px.bar(grouped, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
-        return fig
+        return px.bar(grouped, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
 
     if chart_type == "bar_top_n":
         grouped = (
@@ -188,39 +176,32 @@ def build_chart(df, x_col, y_col, chart_type, top_n=10):
             .head(top_n)
             .sort_values(by=y_col, ascending=True)
         )
-        fig = px.bar(
+        return px.bar(
             grouped,
             x=y_col,
             y=x_col,
             orientation="h",
             title=f"Top {top_n} {x_col} by {y_col}"
         )
-        return fig
 
     if chart_type == "histogram":
         chart_df = chart_df[[x_col]].dropna()
-        fig = px.histogram(chart_df, x=x_col, nbins=30, title=f"Distribution of {x_col}")
-        return fig
+        return px.histogram(chart_df, x=x_col, nbins=30, title=f"Distribution of {x_col}")
 
     if chart_type == "pie":
         counts = chart_df[x_col].value_counts(dropna=False).reset_index()
         counts.columns = [x_col, "count"]
-        fig = px.pie(counts, names=x_col, values="count", title=f"{x_col} distribution")
-        return fig
+        return px.pie(counts, names=x_col, values="count", title=f"{x_col} distribution")
 
     if chart_type == "count_bar":
         counts = chart_df[x_col].value_counts(dropna=False).head(15).reset_index()
         counts.columns = [x_col, "count"]
-        fig = px.bar(counts, x=x_col, y="count", title=f"Top categories in {x_col}")
-        return fig
+        return px.bar(counts, x=x_col, y="count", title=f"Top categories in {x_col}")
 
-    # fallback
-    fig = px.bar(title="No chart available")
-    return fig
+    return px.bar(title="No chart available")
 
 
 def moving_average_projection(df, date_col, value_col, window=7, projection_points=8):
-    """Simple moving average projection."""
     ts = df[[date_col, value_col]].dropna().copy()
     ts = ts.sort_values(date_col)
     ts[value_col] = pd.to_numeric(ts[value_col], errors="coerce")
@@ -237,10 +218,7 @@ def moving_average_projection(df, date_col, value_col, window=7, projection_poin
 
     if inferred_freq is None:
         date_diffs = grouped[date_col].sort_values().diff().dropna()
-        if not date_diffs.empty:
-            avg_diff = date_diffs.mode().iloc[0]
-        else:
-            avg_diff = pd.Timedelta(days=1)
+        avg_diff = date_diffs.mode().iloc[0] if not date_diffs.empty else pd.Timedelta(days=1)
         future_dates = [last_date + avg_diff * (i + 1) for i in range(projection_points)]
     else:
         future_dates = pd.date_range(
@@ -259,8 +237,10 @@ def moving_average_projection(df, date_col, value_col, window=7, projection_poin
     actual_df = grouped.copy()
     actual_df["series_type"] = "Actual"
 
-    combined = pd.concat([actual_df[[date_col, value_col, "series_type"]], forecast_df], ignore_index=True)
-    return combined
+    return pd.concat(
+        [actual_df[[date_col, value_col, "series_type"]], forecast_df],
+        ignore_index=True
+    )
 
 
 def strongest_correlations(df, numeric_cols):
@@ -277,8 +257,7 @@ def strongest_correlations(df, numeric_cols):
             if pd.notna(val):
                 pairs.append((col1, col2, val))
 
-    pairs_sorted = sorted(pairs, key=lambda x: abs(x[2]), reverse=True)
-    return pairs_sorted[:5]
+    return sorted(pairs, key=lambda x: abs(x[2]), reverse=True)[:5]
 
 
 def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
@@ -293,7 +272,7 @@ def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
                 )
 
                 outlier_mask = get_outlier_mask(s)
-                outlier_count = int(outlier_mask.sum()) if hasattr(outlier_mask, "sum") else 0
+                outlier_count = int(outlier_mask.sum())
                 if len(s) > 0 and outlier_count > 0:
                     outlier_pct = outlier_count / len(s) * 100
                     insights.append(
@@ -316,6 +295,7 @@ def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
         temp = df[[date_col, metric_col]].dropna().copy()
         temp[metric_col] = pd.to_numeric(temp[metric_col], errors="coerce")
         temp = temp.dropna()
+
         if not temp.empty:
             trend = temp.groupby(date_col, as_index=False)[metric_col].sum().sort_values(date_col)
             if len(trend) >= 2:
@@ -343,16 +323,72 @@ def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
     return insights
 
 
+def generate_executive_summary(df, numeric_cols, categorical_cols, datetime_cols):
+    summary = []
+
+    if datetime_cols and numeric_cols:
+        date_col = datetime_cols[0]
+        value_col = numeric_cols[0]
+
+        temp = df[[date_col, value_col]].dropna().copy()
+        temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
+        temp = temp.dropna()
+
+        if not temp.empty:
+            trend = temp.groupby(date_col)[value_col].sum().sort_index()
+            if len(trend) >= 2:
+                change = trend.iloc[-1] - trend.iloc[0]
+                direction = "increasing" if change > 0 else "decreasing"
+                summary.append(f"📈 Overall trend shows a {direction} pattern in '{value_col}'.")
+
+    if categorical_cols and numeric_cols:
+        cat = categorical_cols[0]
+        num = numeric_cols[0]
+
+        grouped = (
+            df[[cat, num]]
+            .dropna()
+            .groupby(cat)[num]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        if not grouped.empty:
+            summary.append(f"🏆 Top '{cat}' is '{grouped.index[0]}' contributing the highest '{num}'.")
+
+    if numeric_cols:
+        col = numeric_cols[0]
+        outliers = get_outlier_mask(df[col])
+        if outliers.sum() > 0:
+            summary.append(f"⚠️ Detected {int(outliers.sum())} anomalies in '{col}', which may skew analysis.")
+        else:
+            summary.append(f"✅ No major anomalies detected in '{col}' based on the IQR method.")
+
+    corr_pairs = strongest_correlations(df, numeric_cols)
+    if corr_pairs:
+        c1, c2, val = corr_pairs[0]
+        summary.append(f"🔗 Strong relationship found between '{c1}' and '{c2}' ({val:.2f}).")
+
+    summary.append("💡 Focus on the top drivers, review anomalies, and validate patterns before making business decisions.")
+
+    return summary
+
+
 def df_to_csv_download(df):
     return df.to_csv(index=False).encode("utf-8")
 
 
-def text_download(insights):
+def text_download(insights, exec_summary):
     buffer = io.StringIO()
-    buffer.write("AI Analyst Copilot Dashboard - Generated Insights\n")
-    buffer.write("=" * 55 + "\n\n")
+    buffer.write("AI Analyst Copilot Dashboard - Executive Summary\n")
+    buffer.write("=" * 60 + "\n\n")
+    for i, item in enumerate(exec_summary, start=1):
+        buffer.write(f"{i}. {item}\n")
+
+    buffer.write("\nAI Analyst Copilot Dashboard - Generated Insights\n")
+    buffer.write("=" * 60 + "\n\n")
     for i, insight in enumerate(insights, start=1):
         buffer.write(f"{i}. {insight}\n")
+
     return buffer.getvalue().encode("utf-8")
 
 
@@ -366,9 +402,6 @@ st.write("Turn raw data into actionable business insights instantly.")
 uploaded_file = st.file_uploader("Upload your file", type=["csv", "xlsx"])
 
 if uploaded_file is not None:
-    # =========================
-    # Load Data
-    # =========================
     try:
         if uploaded_file.name.endswith(".csv"):
             raw_df = pd.read_csv(uploaded_file)
@@ -393,7 +426,6 @@ if uploaded_file is not None:
     # Sidebar Filters
     # =========================
     st.sidebar.header("Filters")
-
     filtered_df = df.copy()
 
     with st.sidebar.expander("Time Filters", expanded=True):
@@ -468,6 +500,15 @@ if uploaded_file is not None:
     )
 
     # =========================
+    # Executive Summary
+    # =========================
+    st.subheader("Executive Summary")
+    exec_summary = generate_executive_summary(filtered_df, numeric_cols, categorical_cols, datetime_cols)
+
+    for item in exec_summary:
+        st.success(item)
+
+    # =========================
     # Data Quality Summary
     # =========================
     with st.expander("Data Quality Summary", expanded=False):
@@ -514,9 +555,6 @@ if uploaded_file is not None:
         "Downloads"
     ])
 
-    # -------------------------
-    # Overview
-    # -------------------------
     with tabs[0]:
         st.subheader("Dataset Overview")
 
@@ -546,14 +584,11 @@ if uploaded_file is not None:
                 )
                 st.plotly_chart(count_fig, use_container_width=True)
 
-    # -------------------------
-    # Visual Explorer
-    # -------------------------
     with tabs[1]:
         st.subheader("Smart Chart Builder")
 
         all_x_options = categorical_cols + datetime_cols + identifier_cols + numeric_cols
-        all_x_options = list(dict.fromkeys(all_x_options))  # remove duplicates while preserving order
+        all_x_options = list(dict.fromkeys(all_x_options))
 
         if all_x_options:
             x_col = st.selectbox("Select X-axis / grouping column", all_x_options)
@@ -578,9 +613,6 @@ if uploaded_file is not None:
         except Exception as e:
             st.error(f"Could not build chart: {e}")
 
-    # -------------------------
-    # Forecast & Trends
-    # -------------------------
     with tabs[2]:
         st.subheader("Forecast & Trends")
 
@@ -609,9 +641,6 @@ if uploaded_file is not None:
         else:
             st.info("A trend/projection view requires at least one datetime column and one numeric measure column.")
 
-    # -------------------------
-    # Insights
-    # -------------------------
     with tabs[3]:
         st.subheader("Business Insights")
 
@@ -653,9 +682,6 @@ if uploaded_file is not None:
             box_fig = px.box(filtered_df, y=outlier_col, title=f"Box Plot of {outlier_col}")
             st.plotly_chart(box_fig, use_container_width=True)
 
-    # -------------------------
-    # Downloads
-    # -------------------------
     with tabs[4]:
         st.subheader("Downloads")
 
@@ -669,13 +695,13 @@ if uploaded_file is not None:
         )
 
         st.download_button(
-            label="Download Generated Insights (TXT)",
-            data=text_download(generated_insights),
-            file_name="generated_insights.txt",
+            label="Download Executive Summary & Insights (TXT)",
+            data=text_download(generated_insights, exec_summary),
+            file_name="executive_summary_and_insights.txt",
             mime="text/plain"
         )
 
         st.write("You can use these exports for reporting, portfolio demos, or sharing analysis outputs.")
 
 else:
-    st.info("Upload a CSV or Excel file to explore KPIs, trends, chart recommendations, and automated insights.")
+    st.info("Upload a CSV or Excel file to explore KPIs, trends, chart recommendations, automated insights, and executive summaries.")

@@ -1046,16 +1046,24 @@ A record is flagged if caught by either method. This is broader and more sensiti
                 f"investigate whether this reflects genuine high-value activity or data quality issues in that segment.\n"
             )
 
-        st.info(f"""
+        country_line_text = (
+            country_line
+            if country_line
+            else "- No dominant country-level anomaly segment was identified in the current anomaly rows."
+        )
+
+        st.info(
+            f"""
 **What the anomalies tell us:**
 
 - The **{results['total_anomalies']:,} flagged records** ({results['anomaly_pct']}% of the dataset) represent unusual values relative to the selected detection rule.
 - The average anomalous value is **{avg_anomaly_text}**, versus **{avg_normal_text}** for normal records.
-- {country_line if country_line else "- No dominant country-level anomaly segment was identified in the current anomaly rows.\n"}
+{country_line_text}
 - **{extreme_count:,} Extreme anomalies** (Z-score > 6σ) are the highest-priority records for manual review.
 
 **Recommended next step:** filter to Extreme + High severity records first, validate whether they are legitimate edge cases or data issues, then rerun downstream analysis if needed.
-""")
+"""
+        )
 
     st.divider()
 

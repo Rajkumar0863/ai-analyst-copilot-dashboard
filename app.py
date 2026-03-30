@@ -131,13 +131,20 @@ def compute_metric(series: pd.Series, agg: str):
     clean = pd.to_numeric(series, errors="coerce").dropna()
     if clean.empty:
         return np.nan
-    if agg == "sum":    return clean.sum()
-    if agg == "mean":   return clean.mean()
-    if agg == "median": return clean.median()
-    if agg == "min":    return clean.min()
-    if agg == "max":    return clean.max()
-    if agg == "count":  return clean.count()
-    if agg == "std":    return clean.std()
+    if agg == "sum":
+        return clean.sum()
+    if agg == "mean":
+        return clean.mean()
+    if agg == "median":
+        return clean.median()
+    if agg == "min":
+        return clean.min()
+    if agg == "max":
+        return clean.max()
+    if agg == "count":
+        return clean.count()
+    if agg == "std":
+        return clean.std()
     return np.nan
 
 
@@ -285,10 +292,14 @@ def recommend_chart_type(df, x_col, y_col, numeric_cols, categorical_cols, datet
 
 
 def aggregate_data(grouped_df, x_col, y_col, agg_method):
-    if agg_method == "sum":    return grouped_df.groupby(x_col, as_index=False)[y_col].sum()
-    if agg_method == "mean":   return grouped_df.groupby(x_col, as_index=False)[y_col].mean()
-    if agg_method == "median": return grouped_df.groupby(x_col, as_index=False)[y_col].median()
-    if agg_method == "count":  return grouped_df.groupby(x_col, as_index=False)[y_col].count()
+    if agg_method == "sum":
+        return grouped_df.groupby(x_col, as_index=False)[y_col].sum()
+    if agg_method == "mean":
+        return grouped_df.groupby(x_col, as_index=False)[y_col].mean()
+    if agg_method == "median":
+        return grouped_df.groupby(x_col, as_index=False)[y_col].median()
+    if agg_method == "count":
+        return grouped_df.groupby(x_col, as_index=False)[y_col].count()
     return grouped_df.groupby(x_col, as_index=False)[y_col].sum()
 
 
@@ -308,8 +319,13 @@ def build_chart(df, x_col, y_col, chart_type, top_n=10, agg_method="sum"):
     if chart_type == "bar_top_n":
         grouped = aggregate_data(chart_df[[x_col, y_col]].dropna(), x_col, y_col, agg_method)
         grouped = grouped.sort_values(by=y_col, ascending=False).head(top_n).sort_values(by=y_col, ascending=True)
-        return px.bar(grouped, x=y_col, y=x_col, orientation="h",
-                      title=f"Top {top_n} {x_col} by {agg_method.title()} {y_col}")
+        return px.bar(
+            grouped,
+            x=y_col,
+            y=x_col,
+            orientation="h",
+            title=f"Top {top_n} {x_col} by {agg_method.title()} {y_col}"
+        )
     if chart_type == "histogram":
         chart_df = chart_df[[x_col]].dropna()
         return px.histogram(chart_df, x=x_col, nbins=30, title=f"Distribution of {x_col}")
@@ -358,20 +374,33 @@ def moving_average_projection(df, date_col, value_col, window=7, projection_poin
 
     return pd.concat([actual_df[[date_col, value_col, "series_type"]], forecast_df], ignore_index=True)
 
-
 # =========================
 # Anomaly Detection Engine
 # =========================
 def detect_anomalies(series: pd.Series, method: str = "IQR") -> dict:
     """Run anomaly detection and return full results dict with explainability metadata."""
-    mean, std = series.mean(), series.std()
-    Q1, Q3 = series.quantile(0.25), series.quantile(0.75)
-    IQR = Q3 - Q1
-    iqr_lower = Q1 - 1.5 * IQR
-    iqr_upper = Q3 + 1.5 * IQR
-    z_scores = (series - mean) / std if std > 0 else pd.Series(0.0, index=series.index)
+    clean = pd.to_numeric(series, errors="coerce").astype(float)
+    clean = clean.fillna(clean.median() if clean.notna().any() else 0.0)
 
-    iqr_mask   = (series < iqr_lower) | (series > iqr_upper)
+    mean = clean.mean()
+    std = clean.std()
+    q1 = clean.quantile(0.25)
+    q3 = clean.quantile(0.75)
+    iqr = q3 - q1
+
+    iqr_lower = q1 - 1.5 * iqr
+    iqr_upper = q3 + 1.5 * iqr
+
+    if pd.isna(std) or std == 0:
+        z_scores = pd.Series(0.0, index=clean.index)
+    else:
+        z_scores = (clean - mean) / std
+
+    if pd.isna(iqr) or iqr == 0:
+        iqr_mask = pd.Series(False, index=clean.index)
+    else:
+        iqr_mask = (clean < iqr_lower) | (clean > iqr_upper)
+
     zscore_mask = z_scores.abs() > 3
 
     if method == "IQR":
@@ -382,15 +411,15 @@ def detect_anomalies(series: pd.Series, method: str = "IQR") -> dict:
         mask = iqr_mask | zscore_mask
 
     return {
-        "mask": mask,
-        "z_scores": z_scores,
+        "mask": mask.fillna(False),
+        "z_scores": z_scores.fillna(0.0),
         "iqr_lower": iqr_lower,
         "iqr_upper": iqr_upper,
         "mean": mean,
         "std": std,
-        "Q1": Q1,
-        "Q3": Q3,
-        "IQR": IQR,
+        "Q1": q1,
+        "Q3": q3,
+        "IQR": iqr,
         "iqr_count": int(iqr_mask.sum()),
         "zscore_count": int(zscore_mask.sum()),
         "total_anomalies": int(mask.sum()),
@@ -401,34 +430,56 @@ def detect_anomalies(series: pd.Series, method: str = "IQR") -> dict:
 def build_anomaly_df(df: pd.DataFrame, col: str, results: dict) -> pd.DataFrame:
     """Attach per-row anomaly metadata to the dataframe."""
     adf = df.copy()
-    adf["_is_anomaly"]    = results["mask"]
-    adf["_z_score"]       = results["z_scores"].round(3)
-    adf["_deviation_pct"] = ((adf[col] - results["mean"]) / results["mean"] * 100).round(1)
-    adf["_trigger"]       = adf[col].apply(
-        lambda v: "HIGH — above IQR upper fence" if v > results["iqr_upper"]
-                  else ("LOW — below IQR lower fence" if v < results["iqr_lower"] else "Normal")
-    )
-    adf["_severity"] = adf["_z_score"].abs().apply(
-        lambda z: "🔴 Extreme" if z > 6 else ("🟠 High" if z > 4 else ("🟡 Moderate" if z > 2 else "🟢 Mild"))
-    )
-    return adf
+    metric = pd.to_numeric(adf[col], errors="coerce").astype(float)
 
+    adf["_is_anomaly"] = results["mask"]
+    adf["_z_score"] = results["z_scores"].round(3)
+
+    mean_val = results["mean"]
+    if pd.isna(mean_val) or mean_val == 0:
+        adf["_deviation_pct"] = np.nan
+    else:
+        adf["_deviation_pct"] = ((metric - mean_val) / mean_val * 100).round(1)
+
+    def trigger_label(v):
+        if pd.isna(v):
+            return "Unknown"
+        if v > results["iqr_upper"]:
+            return "HIGH — above IQR upper fence"
+        if v < results["iqr_lower"]:
+            return "LOW — below IQR lower fence"
+        return "Normal"
+
+    adf["_trigger"] = metric.apply(trigger_label)
+
+    def severity_label(z):
+        z_abs = abs(z)
+        if z_abs > 6:
+            return "🔴 Extreme"
+        if z_abs > 4:
+            return "🟠 High"
+        if z_abs > 2:
+            return "🟡 Moderate"
+        return "🟢 Mild"
+
+    adf["_severity"] = adf["_z_score"].apply(severity_label)
+    return adf
 
 # =========================
 # FDE Layer
 # =========================
 def generate_top_priorities(df, numeric_cols, categorical_cols, datetime_cols, business_context):
     priorities = []
-    best_metric   = pick_best_metric_column(numeric_cols, business_context)
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
     best_category = pick_best_category_column(categorical_cols, business_context)
-    best_date     = pick_best_datetime_column(datetime_cols)
+    best_date = pick_best_datetime_column(datetime_cols)
 
     if best_metric:
         metric_series = pd.to_numeric(df[best_metric], errors="coerce").dropna()
         if not metric_series.empty:
-            outlier_mask  = get_outlier_mask(df[best_metric])
+            outlier_mask = get_outlier_mask(df[best_metric])
             outlier_count = int(outlier_mask.sum())
-            outlier_pct   = (outlier_count / len(metric_series) * 100) if len(metric_series) > 0 else 0
+            outlier_pct = (outlier_count / len(metric_series) * 100) if len(metric_series) > 0 else 0
             if outlier_pct >= 10:
                 priorities.append({
                     "priority": "Medium",
@@ -441,7 +492,7 @@ def generate_top_priorities(df, numeric_cols, categorical_cols, datetime_cols, b
                  .groupby(best_date)[best_metric].sum().sort_index())
         if len(trend) >= 2:
             first_val = trend.iloc[0]
-            last_val  = trend.iloc[-1]
+            last_val = trend.iloc[-1]
             if first_val != 0:
                 change_pct = ((last_val - first_val) / first_val) * 100
                 if change_pct <= -20:
@@ -461,7 +512,7 @@ def generate_top_priorities(df, numeric_cols, categorical_cols, datetime_cols, b
         grouped = (df[[best_category, best_metric]].dropna()
                    .groupby(best_category)[best_metric].sum().sort_values(ascending=False))
         if len(grouped) >= 2:
-            total     = grouped.sum()
+            total = grouped.sum()
             top_share = (grouped.iloc[0] / total * 100) if total != 0 else 0
             if top_share >= 40:
                 priorities.append({
@@ -482,9 +533,9 @@ def generate_top_priorities(df, numeric_cols, categorical_cols, datetime_cols, b
 
 def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols, business_context):
     findings = []
-    best_metric   = pick_best_metric_column(numeric_cols, business_context)
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
     best_category = pick_best_category_column(categorical_cols, business_context)
-    best_date     = pick_best_datetime_column(datetime_cols)
+    best_date = pick_best_datetime_column(datetime_cols)
 
     if best_metric:
         metric_series = pd.to_numeric(df[best_metric], errors="coerce").dropna()
@@ -493,7 +544,7 @@ def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols
                     f"with an average of {metric_series.mean():,.2f}.")
             findings.append({"text": text, "confidence": infer_confidence(text)})
 
-            outlier_mask  = get_outlier_mask(df[best_metric])
+            outlier_mask = get_outlier_mask(df[best_metric])
             outlier_count = int(outlier_mask.sum())
             if outlier_count > 0:
                 outlier_pct = (outlier_count / len(metric_series) * 100) if len(metric_series) > 0 else 0
@@ -515,7 +566,7 @@ def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols
                  .groupby(best_date)[best_metric].sum().sort_index())
         if len(trend) >= 2:
             first_val = trend.iloc[0]
-            last_val  = trend.iloc[-1]
+            last_val = trend.iloc[-1]
             direction = "increased" if last_val > first_val else "decreased"
             if first_val != 0:
                 change_pct = ((last_val - first_val) / first_val) * 100
@@ -529,7 +580,7 @@ def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols
     if corr_pairs:
         col1, col2, corr_val = corr_pairs[0]
         direction = "positive" if corr_val > 0 else "negative"
-        strength  = "strong" if abs(corr_val) >= 0.7 else "moderate" if abs(corr_val) >= 0.4 else "weak"
+        strength = "strong" if abs(corr_val) >= 0.7 else "moderate" if abs(corr_val) >= 0.4 else "weak"
         text = (f"The strongest non-trivial measurable relationship is a {strength} {direction} correlation "
                 f"between '{col1}' and '{col2}' ({corr_val:.2f}). This may indicate a business driver, "
                 f"but it should not be treated as proof of causation.")
@@ -540,9 +591,9 @@ def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols
 
 def generate_recommendations(df, numeric_cols, categorical_cols, datetime_cols, business_context):
     recommendations = []
-    best_metric   = pick_best_metric_column(numeric_cols, business_context)
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
     best_category = pick_best_category_column(categorical_cols, business_context)
-    best_date     = pick_best_datetime_column(datetime_cols)
+    best_date = pick_best_datetime_column(datetime_cols)
 
     if best_metric:
         outlier_count = int(get_outlier_mask(df[best_metric]).sum())
@@ -579,7 +630,7 @@ def generate_recommendations(df, numeric_cols, categorical_cols, datetime_cols, 
     }
     recommendations.append(context_recs.get(business_context, context_recs["General Exploration"]))
 
-    seen  = set()
+    seen = set()
     final = []
     for rec in recommendations:
         if rec not in seen:
@@ -589,14 +640,14 @@ def generate_recommendations(df, numeric_cols, categorical_cols, datetime_cols, 
 
 
 def generate_client_story(df, numeric_cols, categorical_cols, datetime_cols, business_context):
-    best_metric   = pick_best_metric_column(numeric_cols, business_context)
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
     best_category = pick_best_category_column(categorical_cols, business_context)
-    best_date     = pick_best_datetime_column(datetime_cols)
+    best_date = pick_best_datetime_column(datetime_cols)
 
-    what_happened       = "Not enough signal detected to summarize what happened."
-    why_it_matters      = "This dataset needs more business context or stronger field coverage."
+    what_happened = "Not enough signal detected to summarize what happened."
+    why_it_matters = "This dataset needs more business context or stronger field coverage."
     what_to_investigate = "Review data quality, field definitions, and analysis scope."
-    suggested_actions   = "Validate the business objective and refine the analysis with a target question."
+    suggested_actions = "Validate the business objective and refine the analysis with a target question."
 
     if best_metric:
         metric_series = pd.to_numeric(df[best_metric], errors="coerce").dropna()
@@ -632,10 +683,10 @@ def generate_client_story(df, numeric_cols, categorical_cols, datetime_cols, bus
 
 
 def generate_executive_summary(df, numeric_cols, categorical_cols, datetime_cols, all_cols, business_context):
-    summary     = []
-    best_metric   = pick_best_metric_column(numeric_cols, business_context)
+    summary = []
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
     best_category = pick_best_category_column(categorical_cols, business_context)
-    best_date     = pick_best_datetime_column(datetime_cols)
+    best_date = pick_best_datetime_column(datetime_cols)
 
     if best_date and best_metric:
         temp = df[[best_date, best_metric]].dropna().copy()
@@ -673,7 +724,6 @@ def generate_executive_summary(df, numeric_cols, categorical_cols, datetime_cols
     summary.append(f"💡 Business context selected: {business_context}. Recommendations below are tailored accordingly.")
     return summary
 
-
 # =========================
 # Downloads
 # =========================
@@ -703,30 +753,38 @@ def text_download(findings, recommendations, exec_summary, client_story, top_pri
 
 
 def anomaly_csv_download(adf: pd.DataFrame, col: str) -> bytes:
-    export = (adf[adf["_is_anomaly"]]
-              .drop(columns=["_is_anomaly"])
-              .rename(columns={
-                  "_z_score": "z_score",
-                  "_deviation_pct": "deviation_pct",
-                  "_trigger": "anomaly_trigger",
-                  "_severity": "severity_tier"
-              }))
-    return export.to_csv(index=False).encode("utf-8")
+    export = adf[adf["_is_anomaly"]].copy()
 
+    if export.empty:
+        export = pd.DataFrame(columns=[
+            col, "z_score", "deviation_pct", "anomaly_trigger", "severity_tier"
+        ])
+        return export.to_csv(index=False).encode("utf-8")
+
+    export = export.drop(columns=["_is_anomaly"], errors="ignore").rename(columns={
+        "_z_score": "z_score",
+        "_deviation_pct": "deviation_pct",
+        "_trigger": "anomaly_trigger",
+        "_severity": "severity_tier"
+    })
+    return export.to_csv(index=False).encode("utf-8")
 
 # =========================
 # Anomaly Tab Renderer
 # =========================
 def render_anomaly_tab(filtered_df: pd.DataFrame, numeric_cols: list, categorical_cols: list):
-    st.markdown("Understand **which** records are flagged, **why** each one was caught, "
-                "and **what** the anomalies mean for your analysis.")
+    st.markdown(
+        "Understand **which** records are flagged, **why** each one was caught, "
+        "and **what** the anomalies mean for your analysis."
+    )
 
-    # ── Controls ─────────────────────────────────────────────────────────────
     ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 1])
     with ctrl1:
+        default_metric = "sales_amount_gbp" if "sales_amount_gbp" in numeric_cols else numeric_cols[0]
         target_col = st.selectbox(
-            "Metric to analyse", numeric_cols,
-            index=numeric_cols.index("sales_amount_gbp") if "sales_amount_gbp" in numeric_cols else 0,
+            "Metric to analyse",
+            numeric_cols,
+            index=numeric_cols.index(default_metric),
             key="anom_metric"
         )
     with ctrl2:
@@ -736,16 +794,24 @@ def render_anomaly_tab(filtered_df: pd.DataFrame, numeric_cols: list, categorica
             key="anom_method"
         )
     with ctrl3:
-        top_n_table = st.number_input("Rows in table", min_value=10, max_value=500, value=50, step=10,
-                                      key="anom_top_n")
+        top_n_table = st.number_input(
+            "Rows in table",
+            min_value=10,
+            max_value=500,
+            value=50,
+            step=10,
+            key="anom_top_n"
+        )
 
-    # ── Run detection ─────────────────────────────────────────────────────────
-    series  = pd.to_numeric(filtered_df[target_col], errors="coerce").fillna(filtered_df[target_col].median())
+    raw_series = pd.to_numeric(filtered_df[target_col], errors="coerce")
+    fallback_value = raw_series.median() if raw_series.notna().any() else 0.0
+    series = raw_series.fillna(fallback_value)
+
     results = detect_anomalies(series, method)
-    adf     = build_anomaly_df(filtered_df, target_col, results)
+    adf = build_anomaly_df(filtered_df, target_col, results)
+    anomaly_rows = adf[adf["_is_anomaly"]].copy()
 
-    # ── Method explainer ──────────────────────────────────────────────────────
-    with st.expander("ℹ️  How does this detection method work?", expanded=False):
+    with st.expander("ℹ️ How does this detection method work?", expanded=False):
         if method == "IQR":
             st.markdown(f"""
 **Interquartile Range (IQR) — how the fences are calculated**
@@ -758,12 +824,7 @@ def render_anomaly_tab(filtered_df: pd.DataFrame, numeric_cols: list, categorica
 | Lower fence (Q1 − 1.5 × IQR) | **{results['iqr_lower']:.2f}** |
 | Upper fence (Q3 + 1.5 × IQR) | **{results['iqr_upper']:.2f}** |
 
-Any record outside these fences is flagged. This method is **robust to extreme values** because
-the fences are anchored on the middle 50% of data, not the mean — so a handful of giant outliers
-will not distort the thresholds.
-
-> **Note:** IQR can be conservative on skewed distributions. Not every flagged record is a
-> business problem — use the severity tiers below to prioritise which ones to investigate first.
+Any record outside these fences is flagged. This method is robust because it depends on the middle 50% of the data.
 """)
         elif method == "Z-Score (>3σ)":
             st.markdown(f"""
@@ -775,185 +836,265 @@ will not distort the thresholds.
 | Standard deviation | **{results['std']:.2f}** |
 | Threshold | **±3σ** |
 
-A record is flagged when `|z| > 3`. Under a normal distribution, only ~0.3% of values should
-exceed this level. This method is sensitive to the mean and std, both of which are themselves
-influenced by extreme outliers.
-
-> **Note:** If the distribution is heavily skewed (as with sales data), Z-score will flag fewer
-> records than IQR but may miss moderate anomalies that sit just outside the bulk of the data.
+A record is flagged when `|z| > 3`.
 """)
         else:
             st.markdown("""
 **Both (Union) — IQR ∪ Z-Score**
 
-A record is flagged if caught by **either** method. This maximises recall (fewer missed anomalies)
-at the cost of a higher false-positive rate. Use this when you want a comprehensive sweep before
-data cleaning, and then triage by severity tier.
+A record is flagged if caught by either method. This is broader and more sensitive.
 """)
 
-    # ── KPI cards ─────────────────────────────────────────────────────────────
     kc1, kc2, kc3, kc4, kc5 = st.columns(5)
-    kc1.metric("🔍 Total Anomalies",   f"{results['total_anomalies']:,}")
-    kc2.metric("📊 Anomaly Rate",       f"{results['anomaly_pct']}%")
-    kc3.metric("📈 IQR Upper Fence",   f"{results['iqr_upper']:.2f}")
-    kc4.metric("📉 IQR Lower Fence",   f"{results['iqr_lower']:.2f}")
-    avg_normal  = adf.loc[~adf["_is_anomaly"], target_col].mean()
-    avg_anomaly = adf.loc[adf["_is_anomaly"],  target_col].mean()
-    lift = round((avg_anomaly / avg_normal - 1) * 100, 1) if avg_normal and avg_normal != 0 else 0
-    kc5.metric("⬆️ Avg vs Normal",     f"+{lift}%" if lift >= 0 else f"{lift}%")
+    kc1.metric("🔍 Total Anomalies", f"{results['total_anomalies']:,}")
+    kc2.metric("📊 Anomaly Rate", f"{results['anomaly_pct']}%")
+    kc3.metric("📈 IQR Upper Fence", f"{results['iqr_upper']:.2f}")
+    kc4.metric("📉 IQR Lower Fence", f"{results['iqr_lower']:.2f}")
+
+    normal_values = adf.loc[~adf["_is_anomaly"], target_col]
+    anomaly_values = adf.loc[adf["_is_anomaly"], target_col]
+
+    avg_normal = pd.to_numeric(normal_values, errors="coerce").mean()
+    avg_anomaly = pd.to_numeric(anomaly_values, errors="coerce").mean()
+
+    if pd.notna(avg_normal) and avg_normal != 0 and pd.notna(avg_anomaly):
+        lift = round((avg_anomaly / avg_normal - 1) * 100, 1)
+    else:
+        lift = 0.0
+
+    kc5.metric("⬆️ Avg vs Normal", f"+{lift}%" if lift >= 0 else f"{lift}%")
 
     st.divider()
 
-    # ── Row 1: Distribution chart + Severity donut ────────────────────────────
     left_col, right_col = st.columns([3, 2])
 
     with left_col:
         st.markdown("**Distribution: Normal vs Anomaly**")
-        normal_vals    = filtered_df.loc[~results["mask"], target_col]
-        anomalous_vals = filtered_df.loc[results["mask"],  target_col]
-
         dist_fig = go.Figure()
-        dist_fig.add_trace(go.Histogram(x=normal_vals,    name="Normal",  nbinsx=80,
-                                        marker_color="#4FC3F7", opacity=0.75))
-        dist_fig.add_trace(go.Histogram(x=anomalous_vals, name="Anomaly", nbinsx=80,
-                                        marker_color="#FF6B6B", opacity=0.85))
-        dist_fig.add_vline(x=results["iqr_upper"], line_dash="dash", line_color="orange",
-                           annotation_text=f"Upper fence ({results['iqr_upper']:.1f})",
-                           annotation_position="top right")
-        if results["iqr_lower"] > float(filtered_df[target_col].min()):
-            dist_fig.add_vline(x=results["iqr_lower"], line_dash="dash", line_color="orange",
-                               annotation_text=f"Lower fence ({results['iqr_lower']:.1f})")
-        dist_fig.update_layout(barmode="overlay", height=340,
-                               xaxis_title=target_col, yaxis_title="Count",
-                               legend=dict(orientation="h"))
+
+        if not normal_values.dropna().empty:
+            dist_fig.add_trace(go.Histogram(
+                x=normal_values,
+                name="Normal",
+                nbinsx=80,
+                marker_color="#4FC3F7",
+                opacity=0.75
+            ))
+
+        if not anomaly_values.dropna().empty:
+            dist_fig.add_trace(go.Histogram(
+                x=anomaly_values,
+                name="Anomaly",
+                nbinsx=80,
+                marker_color="#FF6B6B",
+                opacity=0.85
+            ))
+
+        if pd.notna(results["iqr_upper"]):
+            dist_fig.add_vline(
+                x=results["iqr_upper"],
+                line_dash="dash",
+                line_color="orange",
+                annotation_text=f"Upper fence ({results['iqr_upper']:.1f})",
+                annotation_position="top right"
+            )
+
+        if pd.notna(results["iqr_lower"]) and pd.notna(filtered_df[target_col].min()):
+            if results["iqr_lower"] > float(pd.to_numeric(filtered_df[target_col], errors="coerce").min()):
+                dist_fig.add_vline(
+                    x=results["iqr_lower"],
+                    line_dash="dash",
+                    line_color="orange",
+                    annotation_text=f"Lower fence ({results['iqr_lower']:.1f})"
+                )
+
+        dist_fig.update_layout(
+            barmode="overlay",
+            height=340,
+            xaxis_title=target_col,
+            yaxis_title="Count",
+            legend=dict(orientation="h")
+        )
         st.plotly_chart(dist_fig, use_container_width=True)
 
     with right_col:
         st.markdown("**Anomaly Severity Breakdown**")
-        severity_counts = (adf[adf["_is_anomaly"]]["_severity"]
-                           .value_counts().reset_index())
+        severity_counts = anomaly_rows["_severity"].value_counts().reset_index()
         severity_counts.columns = ["Severity", "Count"]
-        donut_fig = px.pie(
-            severity_counts, names="Severity", values="Count", hole=0.55,
-            color_discrete_sequence=["#FF4444", "#FF8C00", "#FFD700", "#90EE90"]
-        )
-        donut_fig.update_layout(height=340, showlegend=True,
-                                legend=dict(orientation="h", yanchor="bottom", y=-0.2))
-        st.plotly_chart(donut_fig, use_container_width=True)
+
+        if severity_counts.empty:
+            st.info("No anomalies detected for the selected metric and method.")
+        else:
+            donut_fig = px.pie(
+                severity_counts,
+                names="Severity",
+                values="Count",
+                hole=0.55
+            )
+            donut_fig.update_layout(
+                height=340,
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.2)
+            )
+            st.plotly_chart(donut_fig, use_container_width=True)
 
     st.divider()
 
-    # ── Row 2: Z-score scatter ────────────────────────────────────────────────
     st.markdown("**Z-Score Plot — distance of each record from the mean**")
     sample_size = min(3000, len(adf))
-    sample      = adf.sample(sample_size, random_state=42).copy()
+    sample = adf.sample(sample_size, random_state=42).copy()
     sample["_label"] = sample["_is_anomaly"].map({True: "Anomaly", False: "Normal"})
 
     z_fig = px.scatter(
-        sample, x=sample.index, y="_z_score", color="_label",
+        sample,
+        x=sample.index,
+        y="_z_score",
+        color="_label",
         color_discrete_map={"Anomaly": "#FF6B6B", "Normal": "#4FC3F7"},
-        opacity=0.55, height=340,
+        opacity=0.55,
+        height=340,
         labels={"_z_score": "Z-Score", "index": "Record Index"},
         title=f"Z-Score per record (sample of {sample_size:,})"
     )
-    z_fig.add_hline(y=3,  line_dash="dash", line_color="orange", annotation_text="+3σ")
+    z_fig.add_hline(y=3, line_dash="dash", line_color="orange", annotation_text="+3σ")
     z_fig.add_hline(y=-3, line_dash="dash", line_color="orange", annotation_text="-3σ")
-    z_fig.add_hline(y=0,  line_dash="dot",  line_color="#888888")
+    z_fig.add_hline(y=0, line_dash="dot", line_color="#888888")
     st.plotly_chart(z_fig, use_container_width=True)
 
     st.divider()
 
-    # ── Row 3: Anomaly rate by segment ────────────────────────────────────────
     seg_options = [c for c in categorical_cols if c not in ("country_code", "product_id", "customer_id")]
     if seg_options:
         st.markdown("**Anomaly Rate by Segment**")
-        seg_col = st.selectbox("Break down anomalies by", seg_options,
-                               index=seg_options.index("country") if "country" in seg_options else 0,
-                               key="anom_seg")
-        grp = (adf.groupby(seg_col)
-               .agg(total=(target_col, "count"), anomalies=("_is_anomaly", "sum"))
-               .reset_index())
-        grp["anomaly_rate"] = (grp["anomalies"] / grp["total"] * 100).round(1)
+        default_seg = "country" if "country" in seg_options else seg_options[0]
+        seg_col = st.selectbox(
+            "Break down anomalies by",
+            seg_options,
+            index=seg_options.index(default_seg),
+            key="anom_seg"
+        )
+
+        grp = (
+            adf.groupby(seg_col)
+            .agg(total=(target_col, "count"), anomalies=("_is_anomaly", "sum"))
+            .reset_index()
+        )
+        grp["anomaly_rate"] = np.where(
+            grp["total"] > 0,
+            (grp["anomalies"] / grp["total"] * 100).round(1),
+            0.0
+        )
         grp = grp[grp["total"] >= 30].sort_values("anomaly_rate", ascending=True).tail(15)
 
-        seg_fig = px.bar(
-            grp, x="anomaly_rate", y=seg_col, orientation="h",
-            text="anomaly_rate",
-            color="anomaly_rate",
-            color_continuous_scale=["#4FC3F7", "#FF6B6B"],
-            labels={"anomaly_rate": "Anomaly Rate (%)", seg_col: seg_col},
-            title=f"Anomaly Rate (%) by {seg_col}"
-        )
-        seg_fig.update_traces(texttemplate="%{text}%", textposition="outside")
-        seg_fig.update_layout(coloraxis_showscale=False, height=400)
-        st.plotly_chart(seg_fig, use_container_width=True)
+        if grp.empty:
+            st.info("No segment has enough rows for a stable anomaly-rate comparison.")
+        else:
+            seg_fig = px.bar(
+                grp,
+                x="anomaly_rate",
+                y=seg_col,
+                orientation="h",
+                text="anomaly_rate",
+                color="anomaly_rate",
+                color_continuous_scale=["#4FC3F7", "#FF6B6B"],
+                labels={"anomaly_rate": "Anomaly Rate (%)", seg_col: seg_col},
+                title=f"Anomaly Rate (%) by {seg_col}"
+            )
+            seg_fig.update_traces(texttemplate="%{text}%", textposition="outside")
+            seg_fig.update_layout(coloraxis_showscale=False, height=400)
+            st.plotly_chart(seg_fig, use_container_width=True)
 
     st.divider()
 
-    # ── Analyst narrative ─────────────────────────────────────────────────────
     st.markdown("### 📝 Analyst Interpretation")
-    top_seg_country = (adf[adf["_is_anomaly"]]["country"].value_counts().idxmax()
-                       if "country" in adf.columns else "the top segment")
-    top_seg_pct = round(
-        adf[adf["_is_anomaly"]]["country"].value_counts().iloc[0] / results["total_anomalies"] * 100, 1
-    ) if "country" in adf.columns else 0
-    extreme_count = int((adf["_severity"] == "🔴 Extreme").sum())
 
-    st.info(f"""
+    if anomaly_rows.empty:
+        st.info(f"""
+**What the anomaly check tells us:**
+
+- No anomalies were detected for **{target_col}** using the **{method}** method.
+- That usually means the selected metric is relatively stable under the current rule, not that the data is automatically perfect.
+- In this case, the safest next step is to:
+  1. try a different metric,
+  2. switch the detection method,
+  3. or segment the data further to see whether anomalies appear in smaller groups.
+
+**Recommended next step:** use the segment breakdown and business findings tabs to investigate variation even when no anomalies are formally flagged.
+""")
+    else:
+        if "country" in anomaly_rows.columns:
+            country_counts = anomaly_rows["country"].astype(str).value_counts(dropna=True)
+            if not country_counts.empty:
+                top_seg_country = country_counts.idxmax()
+                top_seg_pct = round(country_counts.iloc[0] / len(anomaly_rows) * 100, 1)
+            else:
+                top_seg_country = "N/A"
+                top_seg_pct = 0.0
+        else:
+            top_seg_country = "N/A"
+            top_seg_pct = 0.0
+
+        extreme_count = int((anomaly_rows["_severity"] == "🔴 Extreme").sum())
+
+        avg_normal_text = f"{avg_normal:.2f}" if pd.notna(avg_normal) else "N/A"
+        avg_anomaly_text = f"{avg_anomaly:.2f}" if pd.notna(avg_anomaly) else "N/A"
+
+        country_line = ""
+        if top_seg_country != "N/A":
+            country_line = (
+                f"- **{top_seg_country}** accounts for **{top_seg_pct}%** of all anomalies — "
+                f"investigate whether this reflects genuine high-value activity or data quality issues in that segment.\n"
+            )
+
+        st.info(f"""
 **What the anomalies tell us:**
 
-- The **{results['total_anomalies']:,} flagged records** ({results['anomaly_pct']}% of the dataset) all exceed 
-  the IQR upper fence of **{results['iqr_upper']:.2f}**, meaning they represent unusually large individual 
-  transactions relative to the typical order.
+- The **{results['total_anomalies']:,} flagged records** ({results['anomaly_pct']}% of the dataset) represent unusual values relative to the selected detection rule.
+- The average anomalous value is **{avg_anomaly_text}**, versus **{avg_normal_text}** for normal records.
+- {country_line if country_line else "- No dominant country-level anomaly segment was identified in the current anomaly rows.\n"}
+- **{extreme_count:,} Extreme anomalies** (Z-score > 6σ) are the highest-priority records for manual review.
 
-- The average anomalous transaction is **{avg_anomaly:.2f}**, which is **{lift}% higher** than the 
-  {avg_normal:.2f} average for normal records. This means anomalies are materially distorting the 
-  overall mean and trend lines.
-
-- **{top_seg_country}** accounts for **{top_seg_pct}%** of all anomalies — investigate whether this 
-  reflects genuine high-value activity or data quality issues in that market.
-
-- **{extreme_count:,} Extreme anomalies** (Z-score > 6σ) are the highest-priority records for 
-  review and should be validated before any modelling or forecasting.
-
-**Recommended next step:** Filter to Extreme + High severity records first, validate them as 
-legitimate bulk orders or data errors, then re-run the trend analysis on the cleaned dataset.
+**Recommended next step:** filter to Extreme + High severity records first, validate whether they are legitimate edge cases or data issues, then rerun downstream analysis if needed.
 """)
 
     st.divider()
 
-    # ── Drill-down table ──────────────────────────────────────────────────────
     st.markdown(f"### 📋 Top {int(top_n_table)} Anomalous Records")
-    st.caption("Sorted by Z-Score (most extreme first). Every row shows the exact trigger reason and severity.")
+    st.caption("Sorted by absolute Z-Score (most extreme first). Every row shows the trigger reason and severity.")
 
-    display_cols = [target_col, "_z_score", "_deviation_pct", "_trigger", "_severity"]
-    optional     = ["country", "unit_price_gbp", "quantity_sold", "order_datetime"]
-    display_cols += [c for c in optional if c in adf.columns]
+    if anomaly_rows.empty:
+        st.info("No anomalous records to display for the current metric and method.")
+    else:
+        display_cols = [target_col, "_z_score", "_deviation_pct", "_trigger", "_severity"]
+        optional = ["country", "unit_price_gbp", "quantity_sold", "order_datetime"]
+        display_cols += [c for c in optional if c in adf.columns]
 
-    drilldown = (adf[adf["_is_anomaly"]][display_cols]
-                 .rename(columns={
-                     target_col:      "Value",
-                     "_z_score":      "Z-Score",
-                     "_deviation_pct":"Deviation (%)",
-                     "_trigger":      "Trigger Reason",
-                     "_severity":     "Severity",
-                     "unit_price_gbp":"Unit Price",
-                     "quantity_sold": "Qty Sold",
-                     "order_datetime":"Order Date"
-                 })
-                 .sort_values("Z-Score", ascending=False)
-                 .head(int(top_n_table))
-                 .reset_index(drop=True))
-    st.dataframe(drilldown, use_container_width=True, height=380)
+        drilldown = (
+            anomaly_rows[display_cols]
+            .rename(columns={
+                target_col: "Value",
+                "_z_score": "Z-Score",
+                "_deviation_pct": "Deviation (%)",
+                "_trigger": "Trigger Reason",
+                "_severity": "Severity",
+                "unit_price_gbp": "Unit Price",
+                "quantity_sold": "Qty Sold",
+                "order_datetime": "Order Date"
+            })
+            .assign(_abs_z=lambda d: d["Z-Score"].abs())
+            .sort_values("_abs_z", ascending=False)
+            .drop(columns="_abs_z")
+            .head(int(top_n_table))
+            .reset_index(drop=True)
+        )
+        st.dataframe(drilldown, use_container_width=True, height=380)
 
-    # ── Download ──────────────────────────────────────────────────────────────
     st.download_button(
-        label="⬇️  Download Full Anomaly Report (CSV)",
+        label="⬇️ Download Full Anomaly Report (CSV)",
         data=anomaly_csv_download(adf, target_col),
         file_name="anomaly_report.csv",
         mime="text/csv"
     )
-
 
 # =========================
 # UI Header
@@ -985,9 +1126,6 @@ if uploaded_file is not None:
     st.success("File uploaded successfully.")
     st.info("The platform has automatically profiled the dataset and enabled context-aware analysis.")
 
-    # =========================
-    # Sidebar
-    # =========================
     st.sidebar.header("Analysis Controls")
     business_context = st.sidebar.selectbox("Business Context", BUSINESS_CONTEXTS, index=0)
 
@@ -1023,8 +1161,11 @@ if uploaded_file is not None:
                 max_val = float(series.max())
                 if min_val != max_val:
                     selected_range = st.slider(
-                        f"Filter {col}", min_value=min_val, max_value=max_val,
-                        value=(min_val, max_val), key=f"num_{col}"
+                        f"Filter {col}",
+                        min_value=min_val,
+                        max_value=max_val,
+                        value=(min_val, max_val),
+                        key=f"num_{col}"
                     )
                     filtered_df = filtered_df[
                         pd.to_numeric(filtered_df[col], errors="coerce").between(selected_range[0], selected_range[1])
@@ -1032,28 +1173,22 @@ if uploaded_file is not None:
 
     selected_outlier_col = None
     with st.sidebar.expander("Display Options", expanded=False):
-        remove_outliers    = st.checkbox("Exclude outliers from charts", value=False)
-        show_data_preview  = st.checkbox("Show filtered data preview", value=True)
-        top_n              = st.slider("Top N for high-cardinality charts", min_value=5, max_value=25, value=10)
+        remove_outliers = st.checkbox("Exclude outliers from charts", value=False)
+        show_data_preview = st.checkbox("Show filtered data preview", value=True)
+        top_n = st.slider("Top N for high-cardinality charts", min_value=5, max_value=25, value=10)
         if numeric_cols:
             selected_outlier_col = st.selectbox("Outlier column", ["<None>"] + numeric_cols)
 
     if remove_outliers and selected_outlier_col and selected_outlier_col != "<None>":
-        mask        = get_outlier_mask(filtered_df[selected_outlier_col])
+        mask = get_outlier_mask(filtered_df[selected_outlier_col])
         filtered_df = filtered_df[~mask]
 
-    # =========================
-    # KPI Cards
-    # =========================
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows",            f"{len(filtered_df):,}")
-    c2.metric("Columns",         f"{filtered_df.shape[1]:,}")
-    c3.metric("Missing Values",  f"{int(filtered_df.isna().sum().sum()):,}")
-    c4.metric("Duplicate Rows",  f"{int(filtered_df.duplicated().sum()):,}")
+    c1.metric("Rows", f"{len(filtered_df):,}")
+    c2.metric("Columns", f"{filtered_df.shape[1]:,}")
+    c3.metric("Missing Values", f"{int(filtered_df.isna().sum().sum()):,}")
+    c4.metric("Duplicate Rows", f"{int(filtered_df.duplicated().sum()):,}")
 
-    # =========================
-    # Executive Summary
-    # =========================
     st.subheader("Executive Summary")
     exec_summary = generate_executive_summary(
         filtered_df, numeric_cols, categorical_cols, datetime_cols,
@@ -1062,9 +1197,6 @@ if uploaded_file is not None:
     for item in exec_summary:
         st.success(item)
 
-    # =========================
-    # Top Priorities
-    # =========================
     st.subheader("Top Priorities")
     top_priorities = generate_top_priorities(
         filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context
@@ -1077,9 +1209,6 @@ if uploaded_file is not None:
         else:
             st.info(f"**{item['priority']} Priority — {item['title']}**\n\n{item['detail']}")
 
-    # =========================
-    # Client Story
-    # =========================
     st.subheader("Client Story")
     client_story = generate_client_story(
         filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context
@@ -1092,37 +1221,29 @@ if uploaded_file is not None:
         st.info(f"**What to investigate next**\n\n{client_story['What to investigate next']}")
         st.info(f"**Suggested actions**\n\n{client_story['Suggested actions']}")
 
-    # =========================
-    # Key Metric Explorer
-    # =========================
     st.subheader("Key Metric Explorer")
     if numeric_cols:
         m1, m2 = st.columns([2, 1])
-        default_metric       = pick_best_metric_column(numeric_cols, business_context)
+        default_metric = pick_best_metric_column(numeric_cols, business_context)
         default_metric_index = numeric_cols.index(default_metric) if default_metric in numeric_cols else 0
-        selected_metric_col  = m1.selectbox("Choose numeric column", numeric_cols, index=default_metric_index)
-        selected_agg         = m2.selectbox("Choose aggregation",
-                                            ["sum", "mean", "median", "min", "max", "count", "std"])
+        selected_metric_col = m1.selectbox("Choose numeric column", numeric_cols, index=default_metric_index)
+        selected_agg = m2.selectbox("Choose aggregation", ["sum", "mean", "median", "min", "max", "count", "std"])
         metric_value = compute_metric(filtered_df[selected_metric_col], selected_agg)
         st.metric(f"{selected_agg.title()} of {selected_metric_col}", format_number(metric_value))
         st.caption(f"Exact value: {metric_value}")
     else:
         st.warning("No numeric measure columns detected for metric analysis.")
 
-    # =========================
-    # Tabs — now with Anomaly Drill-Down
-    # =========================
     tabs = st.tabs([
         "Overview",
         "Visual Analysis",
         "Trend Outlook",
         "Key Findings",
-        "🔬 Anomaly Drill-Down",   # ← new tab
+        "🔬 Anomaly Drill-Down",
         "Recommendations",
         "Downloads"
     ])
 
-    # ── Tab 0: Overview ───────────────────────────────────────────────────────
     with tabs[0]:
         st.subheader("Dataset Overview")
         if show_data_preview:
@@ -1130,10 +1251,10 @@ if uploaded_file is not None:
 
         with st.expander("Data Quality & Schema", expanded=False):
             quality_df = pd.DataFrame({
-                "column":       filtered_df.columns,
-                "dtype":        [str(filtered_df[col].dtype) for col in filtered_df.columns],
+                "column": filtered_df.columns,
+                "dtype": [str(filtered_df[col].dtype) for col in filtered_df.columns],
                 "missing_values": [int(filtered_df[col].isna().sum()) for col in filtered_df.columns],
-                "missing_pct":  [round(filtered_df[col].isna().mean() * 100, 2) for col in filtered_df.columns],
+                "missing_pct": [round(filtered_df[col].isna().mean() * 100, 2) for col in filtered_df.columns],
                 "unique_values": [int(filtered_df[col].nunique(dropna=True)) for col in filtered_df.columns],
                 "datetime_parse_confidence_pct": [
                     datetime_confidence.get(col, np.nan) for col in filtered_df.columns
@@ -1168,7 +1289,6 @@ if uploaded_file is not None:
                     use_container_width=True
                 )
 
-    # ── Tab 1: Visual Analysis ────────────────────────────────────────────────
     with tabs[1]:
         st.subheader("Visual Analysis")
         all_x_options = list(dict.fromkeys(categorical_cols + datetime_cols + identifier_cols + numeric_cols))
@@ -1185,11 +1305,11 @@ if uploaded_file is not None:
             st.warning("No usable columns found for charting.")
             st.stop()
 
-        y_options     = ["<None>"] + numeric_cols
-        default_y     = pick_best_metric_column(numeric_cols, business_context)
+        y_options = ["<None>"] + numeric_cols
+        default_y = pick_best_metric_column(numeric_cols, business_context)
         default_y_index = y_options.index(default_y) if default_y in y_options else 0
-        y_choice      = st.selectbox("Select Y-axis / metric column", y_options, index=default_y_index)
-        y_col         = None if y_choice == "<None>" else y_choice
+        y_choice = st.selectbox("Select Y-axis / metric column", y_options, index=default_y_index)
+        y_col = None if y_choice == "<None>" else y_choice
 
         agg_method = "sum"
         if y_col is not None:
@@ -1207,13 +1327,12 @@ if uploaded_file is not None:
         except Exception as e:
             st.error(f"Could not build chart: {e}")
 
-    # ── Tab 2: Trend Outlook ──────────────────────────────────────────────────
     with tabs[2]:
         st.subheader("Trend Outlook")
         if datetime_cols and numeric_cols:
-            date_col  = st.selectbox("Select datetime column", datetime_cols, key="trend_date")
+            date_col = st.selectbox("Select datetime column", datetime_cols, key="trend_date")
             default_trend_metric = pick_best_metric_column(numeric_cols, business_context)
-            default_trend_index  = numeric_cols.index(default_trend_metric) if default_trend_metric in numeric_cols else 0
+            default_trend_index = numeric_cols.index(default_trend_metric) if default_trend_metric in numeric_cols else 0
             value_col = st.selectbox("Select numeric column for trend/projection", numeric_cols,
                                      index=default_trend_index, key="trend_value")
             ma_window = st.slider("Moving average window", min_value=3, max_value=30, value=7)
@@ -1230,7 +1349,6 @@ if uploaded_file is not None:
         else:
             st.info("A trend view requires at least one datetime column and one numeric measure column.")
 
-    # ── Tab 3: Key Findings ───────────────────────────────────────────────────
     with tabs[3]:
         st.subheader("Key Findings")
         findings = generate_business_findings(
@@ -1255,21 +1373,20 @@ if uploaded_file is not None:
 
         if numeric_cols:
             st.markdown("### Outlier Review")
-            outlier_col   = st.selectbox("Choose numeric column for outlier analysis", numeric_cols, key="outlier_col")
-            outlier_mask  = get_outlier_mask(filtered_df[outlier_col])
+            outlier_col = st.selectbox("Choose numeric column for outlier analysis", numeric_cols, key="outlier_col")
+            outlier_mask = get_outlier_mask(filtered_df[outlier_col])
             outlier_count = int(outlier_mask.sum())
             non_null_count = int(pd.to_numeric(filtered_df[outlier_col], errors="coerce").notna().sum())
-            outlier_pct   = (outlier_count / non_null_count * 100) if non_null_count > 0 else 0
+            outlier_pct = (outlier_count / non_null_count * 100) if non_null_count > 0 else 0
 
             oc1, oc2 = st.columns(2)
             oc1.metric("Potential Outliers", f"{outlier_count:,}")
-            oc2.metric("Outlier %",          f"{outlier_pct:.2f}%")
+            oc2.metric("Outlier %", f"{outlier_pct:.2f}%")
             st.plotly_chart(
                 px.box(filtered_df, y=outlier_col, title=f"Box Plot of {outlier_col}"),
                 use_container_width=True
             )
 
-    # ── Tab 4: Anomaly Drill-Down (NEW) ───────────────────────────────────────
     with tabs[4]:
         st.subheader("🔬 Anomaly Drill-Down & Explainability")
         if numeric_cols:
@@ -1277,7 +1394,6 @@ if uploaded_file is not None:
         else:
             st.info("No numeric columns available for anomaly analysis.")
 
-    # ── Tab 5: Recommendations ────────────────────────────────────────────────
     with tabs[5]:
         st.subheader("Recommended Focus Areas")
         recommendations = generate_recommendations(
@@ -1289,13 +1405,12 @@ if uploaded_file is not None:
         else:
             st.warning("Not enough signal to generate recommendations.")
 
-    # ── Tab 6: Downloads ──────────────────────────────────────────────────────
     with tabs[6]:
         st.subheader("Downloads")
 
-        findings        = generate_business_findings(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
+        findings = generate_business_findings(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
         recommendations = generate_recommendations(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
-        top_priorities  = generate_top_priorities(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
+        top_priorities = generate_top_priorities(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
 
         st.download_button(
             label="Download Filtered Data (CSV)",
@@ -1310,12 +1425,13 @@ if uploaded_file is not None:
             mime="text/plain"
         )
 
-        # Anomaly export (pre-computed for the best metric)
         best_metric = pick_best_metric_column(numeric_cols, business_context)
         if best_metric:
-            series  = pd.to_numeric(filtered_df[best_metric], errors="coerce").fillna(filtered_df[best_metric].median())
+            metric_series = pd.to_numeric(filtered_df[best_metric], errors="coerce")
+            metric_fallback = metric_series.median() if metric_series.notna().any() else 0.0
+            series = metric_series.fillna(metric_fallback)
             results = detect_anomalies(series, "IQR")
-            adf     = build_anomaly_df(filtered_df, best_metric, results)
+            adf = build_anomaly_df(filtered_df, best_metric, results)
             st.download_button(
                 label=f"Download Anomaly Report — {best_metric} (CSV)",
                 data=anomaly_csv_download(adf, best_metric),

@@ -41,6 +41,15 @@ BUSINESS_CONTEXTS = [
     "Financial Performance"
 ]
 
+TRIVIAL_TIME_COLUMNS = {
+    "year", "month", "week", "week_of_year", "day", "day_of_week",
+    "quarter", "is_weekend", "order_hour", "hour"
+}
+
+LOW_VALUE_METRIC_COLUMNS = {
+    "year", "month", "week_of_year", "day_of_week", "order_hour", "is_weekend"
+}
+
 # =========================
 # Helpers
 # =========================
@@ -151,27 +160,24 @@ def get_outlier_mask(series: pd.Series):
     return (clean < lower) | (clean > upper)
 
 
-def strongest_correlations(df, numeric_cols):
-    valid_numeric_cols = []
-    for col in numeric_cols:
-        clean = pd.to_numeric(df[col], errors="coerce")
-        if clean.nunique(dropna=True) > 1:
-            valid_numeric_cols.append(col)
+def infer_confidence(label, value=None, extra=None):
+    label_lower = label.lower()
 
-    if len(valid_numeric_cols) < 2:
-        return [], valid_numeric_cols
+    if "trend" in label_lower or "decreased" in label_lower or "increased" in label_lower:
+        return "High"
 
-    corr = df[valid_numeric_cols].corr(numeric_only=True)
-    pairs = []
+    if "outlier" in label_lower or "anomal" in label_lower:
+        return "Medium"
 
-    for i in range(len(corr.columns)):
-        for j in range(i + 1, len(corr.columns)):
-            col1, col2 = corr.columns[i], corr.columns[j]
-            val = corr.iloc[i, j]
-            if pd.notna(val):
-                pairs.append((col1, col2, val))
+    if "correlation" in label_lower:
+        if value is not None and abs(value) >= 0.7:
+            return "Medium"
+        return "Low"
 
-    return sorted(pairs, key=lambda x: abs(x[2]), reverse=True)[:5], valid_numeric_cols
+    if "top" in label_lower or "segment" in label_lower or "country" in label_lower:
+        return "High"
+
+    return "Medium"
 
 
 def classify_dataset(categorical_cols, numeric_cols, all_cols):
@@ -203,12 +209,14 @@ def pick_best_metric_column(numeric_cols, context="General Exploration"):
 
     for keyword in priorities:
         for col in numeric_cols:
-            if keyword in col.lower():
+            if keyword in col.lower() and col.lower() not in LOW_VALUE_METRIC_COLUMNS:
                 return col
 
-    bad_fallbacks = {"age", "employeecount", "standardhours"}
-    filtered = [col for col in numeric_cols if col.lower() not in bad_fallbacks]
-    return filtered[0] if filtered else numeric_cols[0]
+    filtered = [col for col in numeric_cols if col.lower() not in LOW_VALUE_METRIC_COLUMNS]
+    if filtered:
+        return filtered[0]
+
+    return numeric_cols[0]
 
 
 def pick_best_category_column(categorical_cols, context="General Exploration"):
@@ -236,6 +244,44 @@ def pick_best_category_column(categorical_cols, context="General Exploration"):
 
 def pick_best_datetime_column(datetime_cols):
     return datetime_cols[0] if datetime_cols else None
+
+
+def strongest_correlations(df, numeric_cols):
+    valid_numeric_cols = []
+    for col in numeric_cols:
+        clean = pd.to_numeric(df[col], errors="coerce")
+        if clean.nunique(dropna=True) > 1:
+            valid_numeric_cols.append(col)
+
+    if len(valid_numeric_cols) < 2:
+        return [], valid_numeric_cols
+
+    corr = df[valid_numeric_cols].corr(numeric_only=True)
+    pairs = []
+
+    def is_trivial_pair(col1, col2):
+        c1 = col1.lower()
+        c2 = col2.lower()
+
+        trivial_time = c1 in TRIVIAL_TIME_COLUMNS and c2 in TRIVIAL_TIME_COLUMNS
+        exact_family = (
+            ("month" in c1 and "week" in c2) or
+            ("month" in c2 and "week" in c1) or
+            ("year" in c1 and "month" in c2) or
+            ("year" in c2 and "month" in c1) or
+            ("day" in c1 and "hour" in c2) or
+            ("day" in c2 and "hour" in c1)
+        )
+        return trivial_time or exact_family
+
+    for i in range(len(corr.columns)):
+        for j in range(i + 1, len(corr.columns)):
+            col1, col2 = corr.columns[i], corr.columns[j]
+            val = corr.iloc[i, j]
+            if pd.notna(val) and not is_trivial_pair(col1, col2):
+                pairs.append((col1, col2, val))
+
+    return sorted(pairs, key=lambda x: abs(x[2]), reverse=True)[:5], valid_numeric_cols
 
 
 def recommend_chart_type(df, x_col, y_col, numeric_cols, categorical_cols, datetime_cols, identifier_cols):
@@ -363,6 +409,81 @@ def moving_average_projection(df, date_col, value_col, window=7, projection_poin
 # =========================
 # FDE Layer
 # =========================
+def generate_top_priorities(df, numeric_cols, categorical_cols, datetime_cols, business_context):
+    priorities = []
+
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
+    best_category = pick_best_category_column(categorical_cols, business_context)
+    best_date = pick_best_datetime_column(datetime_cols)
+
+    if best_metric:
+        metric_series = pd.to_numeric(df[best_metric], errors="coerce").dropna()
+        if not metric_series.empty:
+            outlier_mask = get_outlier_mask(df[best_metric])
+            outlier_count = int(outlier_mask.sum())
+            outlier_pct = (outlier_count / len(metric_series) * 100) if len(metric_series) > 0 else 0
+
+            if outlier_pct >= 10:
+                priorities.append({
+                    "priority": "Medium",
+                    "title": "Data anomaly review",
+                    "detail": f"'{best_metric}' has {outlier_count:,} potential anomalies ({outlier_pct:.1f}%), so summary metrics may be distorted."
+                })
+
+    if best_date and best_metric:
+        trend = (
+            df[[best_date, best_metric]]
+            .dropna()
+            .groupby(best_date)[best_metric]
+            .sum()
+            .sort_index()
+        )
+        if len(trend) >= 2:
+            first_val = trend.iloc[0]
+            last_val = trend.iloc[-1]
+            if first_val != 0:
+                change_pct = ((last_val - first_val) / first_val) * 100
+                if change_pct <= -20:
+                    priorities.insert(0, {
+                        "priority": "High",
+                        "title": "Metric decline",
+                        "detail": f"'{best_metric}' declined by {abs(change_pct):.2f}% over the observed period."
+                    })
+                elif change_pct >= 20:
+                    priorities.insert(0, {
+                        "priority": "High",
+                        "title": "Metric shift",
+                        "detail": f"'{best_metric}' increased by {change_pct:.2f}% over the observed period, which may indicate a major structural change."
+                    })
+
+    if best_category and best_metric:
+        grouped = (
+            df[[best_category, best_metric]]
+            .dropna()
+            .groupby(best_category)[best_metric]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        if len(grouped) >= 2:
+            total = grouped.sum()
+            top_share = (grouped.iloc[0] / total * 100) if total != 0 else 0
+            if top_share >= 40:
+                priorities.append({
+                    "priority": "Medium",
+                    "title": "Concentration risk",
+                    "detail": f"The top '{best_category}' group contributes {top_share:.1f}% of total '{best_metric}', suggesting dependency risk."
+                })
+
+    if not priorities:
+        priorities.append({
+            "priority": "Low",
+            "title": "No major risk signal",
+            "detail": "No urgent risk pattern was automatically detected. Continue with deeper segmented analysis."
+        })
+
+    return priorities[:3]
+
+
 def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols, business_context):
     findings = []
 
@@ -373,16 +494,27 @@ def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols
     if best_metric:
         metric_series = pd.to_numeric(df[best_metric], errors="coerce").dropna()
         if not metric_series.empty:
-            findings.append(
-                f"The primary metric '{best_metric}' has a total of {metric_series.sum():,.2f} and an average of {metric_series.mean():,.2f}."
+            text = (
+                f"The primary business metric '{best_metric}' totals {metric_series.sum():,.2f} "
+                f"with an average of {metric_series.mean():,.2f}."
             )
+            findings.append({
+                "text": text,
+                "confidence": infer_confidence(text)
+            })
 
             outlier_mask = get_outlier_mask(df[best_metric])
             outlier_count = int(outlier_mask.sum())
             if outlier_count > 0:
-                findings.append(
-                    f"There are {outlier_count:,} potential anomalies in '{best_metric}', which may distort averages and trend interpretation."
+                outlier_pct = (outlier_count / len(metric_series) * 100) if len(metric_series) > 0 else 0
+                text = (
+                    f"'{best_metric}' contains {outlier_count:,} potential anomalies "
+                    f"({outlier_pct:.1f}% of non-null records), so averages and trends should be interpreted carefully."
                 )
+                findings.append({
+                    "text": text,
+                    "confidence": infer_confidence(text)
+                })
 
     if best_category and best_metric:
         grouped = (
@@ -397,10 +529,15 @@ def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols
             top_value = grouped.iloc[0]
             bottom_group = grouped.index[-1]
             bottom_value = grouped.iloc[-1]
-
-            findings.append(
-                f"The strongest segment in '{best_category}' is '{top_group}' with {top_value:,.2f} in '{best_metric}', while '{bottom_group}' contributes the least at {bottom_value:,.2f}."
+            text = (
+                f"Performance is uneven across '{best_category}'. "
+                f"'{top_group}' leads with {top_value:,.2f} in '{best_metric}', "
+                f"while '{bottom_group}' contributes only {bottom_value:,.2f}."
             )
+            findings.append({
+                "text": text,
+                "confidence": infer_confidence(text)
+            })
 
     if best_date and best_metric:
         trend = (
@@ -413,22 +550,37 @@ def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols
         if len(trend) >= 2:
             first_val = trend.iloc[0]
             last_val = trend.iloc[-1]
-            change_pct = ((last_val - first_val) / first_val * 100) if first_val != 0 else np.nan
             direction = "increased" if last_val > first_val else "decreased"
-
-            findings.append(
-                f"Over time, '{best_metric}' has {direction} from {first_val:,.2f} to {last_val:,.2f}" +
-                (f" ({change_pct:.2f}%)." if pd.notna(change_pct) else ".")
-            )
+            if first_val != 0:
+                change_pct = ((last_val - first_val) / first_val) * 100
+                text = (
+                    f"Over time, '{best_metric}' has {direction} from {first_val:,.2f} "
+                    f"to {last_val:,.2f} ({change_pct:.2f}%). This is a material shift that deserves attention."
+                )
+            else:
+                text = (
+                    f"Over time, '{best_metric}' has {direction} from {first_val:,.2f} "
+                    f"to {last_val:,.2f}."
+                )
+            findings.append({
+                "text": text,
+                "confidence": infer_confidence(text)
+            })
 
     corr_pairs, _ = strongest_correlations(df, numeric_cols)
     if corr_pairs:
         col1, col2, corr_val = corr_pairs[0]
         direction = "positive" if corr_val > 0 else "negative"
         strength = "strong" if abs(corr_val) >= 0.7 else "moderate" if abs(corr_val) >= 0.4 else "weak"
-        findings.append(
-            f"The strongest measurable relationship is a {strength} {direction} correlation between '{col1}' and '{col2}' ({corr_val:.2f}). This should be investigated as a possible business driver, not treated as proof of causation."
+        text = (
+            f"The strongest non-trivial measurable relationship is a {strength} {direction} correlation "
+            f"between '{col1}' and '{col2}' ({corr_val:.2f}). This may indicate a business driver, "
+            f"but it should not be treated as proof of causation."
         )
+        findings.append({
+            "text": text,
+            "confidence": infer_confidence(text, value=corr_val)
+        })
 
     return findings
 
@@ -443,22 +595,11 @@ def generate_recommendations(df, numeric_cols, categorical_cols, datetime_cols, 
     if best_metric:
         outlier_mask = get_outlier_mask(df[best_metric])
         outlier_count = int(outlier_mask.sum())
+        non_null = pd.to_numeric(df[best_metric], errors="coerce").notna().sum()
+
         if outlier_count > 0:
             recommendations.append(
-                f"Validate unusual values in '{best_metric}' before taking action, because anomalies may be skewing results."
-            )
-
-    if best_category and best_metric:
-        grouped = (
-            df[[best_category, best_metric]]
-            .dropna()
-            .groupby(best_category)[best_metric]
-            .sum()
-            .sort_values(ascending=False)
-        )
-        if len(grouped) >= 2:
-            recommendations.append(
-                f"Prioritize investigation into lower-performing '{best_category}' groups and compare them against top-performing segments to identify operational or market differences."
+                f"Review the {outlier_count:,} unusual values in '{best_metric}' first, because they may be inflating or masking the true business pattern."
             )
 
     if best_date and best_metric:
@@ -469,38 +610,52 @@ def generate_recommendations(df, numeric_cols, categorical_cols, datetime_cols, 
             .sum()
             .sort_index()
         )
-        if len(trend) >= 2 and trend.iloc[-1] < trend.iloc[0]:
+        if len(trend) >= 2:
+            first_val = trend.iloc[0]
+            last_val = trend.iloc[-1]
+            if first_val != 0:
+                change_pct = ((last_val - first_val) / first_val) * 100
+                if change_pct < 0:
+                    recommendations.append(
+                        f"Investigate the period where '{best_metric}' declined by {abs(change_pct):.2f}% and compare that period against pricing, demand, and category mix changes."
+                    )
+
+    if best_category and best_metric:
+        grouped = (
+            df[[best_category, best_metric]]
+            .dropna()
+            .groupby(best_category)[best_metric]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        if len(grouped) >= 2:
+            top_group = grouped.index[0]
+            bottom_group = grouped.index[-1]
             recommendations.append(
-                f"The selected metric shows decline over time. Review the period where '{best_metric}' began to soften and investigate whether pricing, demand, staffing, or process changes are linked."
+                f"Compare high-performing '{best_category}' group '{top_group}' against low-performing group '{bottom_group}' to identify operational, market, or customer-mix differences."
             )
 
     if business_context == "Sales Performance":
-        recommendations.append("Focus on the highest-value categories, regions, or products first to protect revenue concentration.")
-        recommendations.append("Review weak-performing segments for pricing, channel, or customer mix issues.")
+        recommendations.append("Review whether revenue concentration is too dependent on a small number of regions, categories, or products.")
     elif business_context == "Customer Retention":
-        recommendations.append("Identify whether revenue is concentrated among a small share of customers and prioritize retention for those segments.")
-        recommendations.append("Track repeat behavior, segment stability, and any drop in order frequency over time.")
+        recommendations.append("Segment customers by value and repeat behavior to determine where retention interventions will have the highest payoff.")
     elif business_context == "HR Attrition":
-        recommendations.append("Investigate whether attrition patterns align with overtime, tenure, compensation, or specific departments.")
-        recommendations.append("Compare high-risk employee groups against lower-risk groups to identify manageable retention levers.")
+        recommendations.append("Test whether attrition risk is concentrated in specific departments, tenure bands, or overtime-heavy groups.")
     elif business_context == "Operational Efficiency":
-        recommendations.append("Examine cost, time, or productivity outliers to identify process bottlenecks or inconsistent execution.")
-        recommendations.append("Benchmark lower-performing units against stronger units to identify repeatable operational practices.")
+        recommendations.append("Use high-variance process or time metrics to isolate bottlenecks and inconsistent execution.")
     elif business_context == "Financial Performance":
-        recommendations.append("Separate growth effects from margin effects so that headline improvement is not masking cost pressure.")
-        recommendations.append("Review categories with strong revenue but weak profitability for potential leakage or inefficient spend.")
+        recommendations.append("Separate revenue growth from cost pressure so that apparent performance gains do not hide profitability leakage.")
     else:
-        recommendations.append("Use the strongest trends, anomalies, and segment differences as the starting point for deeper root-cause analysis.")
+        recommendations.append("Use the strongest trend, anomaly, and segment imbalance signals as the starting point for deeper root-cause analysis.")
 
-    # Remove duplicates while preserving order
     seen = set()
-    deduped = []
-    for item in recommendations:
-        if item not in seen:
-            deduped.append(item)
-            seen.add(item)
+    final_recommendations = []
+    for rec in recommendations:
+        if rec not in seen:
+            final_recommendations.append(rec)
+            seen.add(rec)
 
-    return deduped[:6]
+    return final_recommendations[:6]
 
 
 def generate_client_story(df, numeric_cols, categorical_cols, datetime_cols, business_context):
@@ -606,7 +761,7 @@ def generate_executive_summary(df, numeric_cols, categorical_cols, datetime_cols
     corr_pairs, _ = strongest_correlations(df, numeric_cols)
     if corr_pairs:
         c1, c2, val = corr_pairs[0]
-        summary.append(f"🔗 Strongest measurable relationship is between '{c1}' and '{c2}' ({val:.2f}).")
+        summary.append(f"🔗 Strongest non-trivial measurable relationship is between '{c1}' and '{c2}' ({val:.2f}).")
 
     summary.append(f"💡 Business context selected: {business_context}. Recommendations below are tailored accordingly.")
     return summary
@@ -616,12 +771,17 @@ def df_to_csv_download(df):
     return df.to_csv(index=False).encode("utf-8")
 
 
-def text_download(findings, recommendations, exec_summary, client_story):
+def text_download(findings, recommendations, exec_summary, client_story, top_priorities):
     buffer = io.StringIO()
     buffer.write("Client Intelligence Platform - Executive Summary\n")
     buffer.write("=" * 70 + "\n\n")
     for i, item in enumerate(exec_summary, start=1):
         buffer.write(f"{i}. {item}\n")
+
+    buffer.write("\nTop Priorities\n")
+    buffer.write("=" * 70 + "\n\n")
+    for i, item in enumerate(top_priorities, start=1):
+        buffer.write(f"{i}. [{item['priority']}] {item['title']}: {item['detail']}\n")
 
     buffer.write("\nClient Story\n")
     buffer.write("=" * 70 + "\n\n")
@@ -631,7 +791,7 @@ def text_download(findings, recommendations, exec_summary, client_story):
     buffer.write("Key Findings\n")
     buffer.write("=" * 70 + "\n\n")
     for i, item in enumerate(findings, start=1):
-        buffer.write(f"{i}. {item}\n")
+        buffer.write(f"{i}. {item['text']} (Confidence: {item['confidence']})\n")
 
     buffer.write("\nRecommended Focus Areas\n")
     buffer.write("=" * 70 + "\n\n")
@@ -764,6 +924,26 @@ if uploaded_file is not None:
 
     for item in exec_summary:
         st.success(item)
+
+    # =========================
+    # Top Priorities
+    # =========================
+    st.subheader("Top Priorities")
+    top_priorities = generate_top_priorities(
+        filtered_df,
+        numeric_cols,
+        categorical_cols,
+        datetime_cols,
+        business_context
+    )
+
+    for item in top_priorities:
+        if item["priority"] == "High":
+            st.error(f"**{item['priority']} Priority — {item['title']}**\n\n{item['detail']}")
+        elif item["priority"] == "Medium":
+            st.warning(f"**{item['priority']} Priority — {item['title']}**\n\n{item['detail']}")
+        else:
+            st.info(f"**{item['priority']} Priority — {item['title']}**\n\n{item['detail']}")
 
     # =========================
     # Client Story
@@ -916,7 +1096,17 @@ if uploaded_file is not None:
 
         if datetime_cols and numeric_cols:
             date_col = st.selectbox("Select datetime column", datetime_cols, key="trend_date")
-            value_col = st.selectbox("Select numeric column for trend/projection", numeric_cols, key="trend_value")
+
+            default_trend_metric = pick_best_metric_column(numeric_cols, business_context)
+            default_trend_index = numeric_cols.index(default_trend_metric) if default_trend_metric in numeric_cols else 0
+
+            value_col = st.selectbox(
+                "Select numeric column for trend/projection",
+                numeric_cols,
+                index=default_trend_index,
+                key="trend_value"
+            )
+
             ma_window = st.slider("Moving average window", min_value=3, max_value=30, value=7)
 
             projection_df = moving_average_projection(filtered_df, date_col, value_col, window=ma_window)
@@ -944,7 +1134,7 @@ if uploaded_file is not None:
 
         if findings:
             for idx, item in enumerate(findings, start=1):
-                st.info(f"{idx}. {item}")
+                st.info(f"{idx}. {item['text']}\n\n**Confidence:** {item['confidence']}")
         else:
             st.warning("Not enough data to generate findings.")
 
@@ -993,6 +1183,7 @@ if uploaded_file is not None:
 
         findings = generate_business_findings(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
         recommendations = generate_recommendations(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
+        top_priorities = generate_top_priorities(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
 
         st.download_button(
             label="Download Filtered Data (CSV)",
@@ -1002,8 +1193,8 @@ if uploaded_file is not None:
         )
 
         st.download_button(
-            label="Download Executive Summary, Client Story, Findings & Recommendations (TXT)",
-            data=text_download(findings, recommendations, exec_summary, client_story),
+            label="Download Executive Summary, Priorities, Client Story, Findings & Recommendations (TXT)",
+            data=text_download(findings, recommendations, exec_summary, client_story, top_priorities),
             file_name="client_intelligence_report.txt",
             mime="text/plain"
         )

@@ -6,13 +6,13 @@ import streamlit as st
 import plotly.express as px
 
 st.set_page_config(
-    page_title="AI Analyst Copilot Dashboard",
+    page_title="Client Intelligence Platform",
     page_icon="📊",
     layout="wide"
 )
 
 # =========================
-# Helpers
+# Constants
 # =========================
 ID_KEYWORDS = [
     "id", "order_id", "product_id", "customer_id", "invoice", "transaction_id",
@@ -29,10 +29,21 @@ BUSINESS_METRIC_KEYWORDS = [
 CATEGORY_PRIORITY_KEYWORDS = [
     "country", "region", "department", "category", "segment", "product",
     "jobrole", "educationfield", "gender", "attrition", "businesstravel",
-    "maritalstatus", "overtime", "agegroup"
+    "maritalstatus", "overtime", "agegroup", "customer", "channel"
 ]
 
+BUSINESS_CONTEXTS = [
+    "General Exploration",
+    "Sales Performance",
+    "Customer Retention",
+    "HR Attrition",
+    "Operational Efficiency",
+    "Financial Performance"
+]
 
+# =========================
+# Helpers
+# =========================
 def safe_to_datetime(series: pd.Series) -> pd.Series:
     try:
         converted = pd.to_datetime(series, errors="coerce")
@@ -58,14 +69,19 @@ def detect_column_types(df: pd.DataFrame):
     temp_df.columns = [str(c) for c in temp_df.columns]
 
     datetime_cols = []
+    datetime_confidence = {}
+
     for col in temp_df.columns:
         if temp_df[col].dtype == "object":
-            converted = safe_to_datetime(temp_df[col])
-            if pd.api.types.is_datetime64_any_dtype(converted):
+            converted = pd.to_datetime(temp_df[col], errors="coerce")
+            valid_ratio = converted.notna().mean()
+            datetime_confidence[col] = round(valid_ratio * 100, 2)
+            if valid_ratio > 0.7:
                 temp_df[col] = converted
                 datetime_cols.append(col)
         elif pd.api.types.is_datetime64_any_dtype(temp_df[col]):
             datetime_cols.append(col)
+            datetime_confidence[col] = 100.0
 
     numeric_cols = temp_df.select_dtypes(include=np.number).columns.tolist()
     all_cols = temp_df.columns.tolist()
@@ -80,7 +96,8 @@ def detect_column_types(df: pd.DataFrame):
 
         if col in numeric_cols:
             nunique_ratio = temp_df[col].nunique(dropna=True) / max(len(temp_df), 1)
-            if nunique_ratio > 0.95 and is_integer_like(temp_df[col]):
+            metric_like = any(k in col_lower for k in BUSINESS_METRIC_KEYWORDS)
+            if nunique_ratio > 0.95 and is_integer_like(temp_df[col]) and not metric_like:
                 identifier_cols.append(col)
 
     numeric_measure_cols = [c for c in numeric_cols if c not in identifier_cols]
@@ -89,7 +106,7 @@ def detect_column_types(df: pd.DataFrame):
         if c not in numeric_cols and c not in datetime_cols
     ]
 
-    return temp_df, numeric_measure_cols, categorical_cols, datetime_cols, identifier_cols
+    return temp_df, numeric_measure_cols, categorical_cols, datetime_cols, identifier_cols, datetime_confidence
 
 
 def format_number(value):
@@ -134,32 +151,27 @@ def get_outlier_mask(series: pd.Series):
     return (clean < lower) | (clean > upper)
 
 
-def pick_best_metric_column(numeric_cols):
-    if not numeric_cols:
-        return None
-
+def strongest_correlations(df, numeric_cols):
+    valid_numeric_cols = []
     for col in numeric_cols:
-        if any(keyword in col.lower() for keyword in BUSINESS_METRIC_KEYWORDS):
-            return col
+        clean = pd.to_numeric(df[col], errors="coerce")
+        if clean.nunique(dropna=True) > 1:
+            valid_numeric_cols.append(col)
 
-    bad_fallbacks = {"age", "employeecount", "standardhours"}
-    filtered = [col for col in numeric_cols if col.lower() not in bad_fallbacks]
-    return filtered[0] if filtered else numeric_cols[0]
+    if len(valid_numeric_cols) < 2:
+        return [], valid_numeric_cols
 
+    corr = df[valid_numeric_cols].corr(numeric_only=True)
+    pairs = []
 
-def pick_best_category_column(categorical_cols):
-    if not categorical_cols:
-        return None
+    for i in range(len(corr.columns)):
+        for j in range(i + 1, len(corr.columns)):
+            col1, col2 = corr.columns[i], corr.columns[j]
+            val = corr.iloc[i, j]
+            if pd.notna(val):
+                pairs.append((col1, col2, val))
 
-    for col in categorical_cols:
-        if any(keyword in col.lower() for keyword in CATEGORY_PRIORITY_KEYWORDS):
-            return col
-
-    return categorical_cols[0]
-
-
-def pick_best_datetime_column(datetime_cols):
-    return datetime_cols[0] if datetime_cols else None
+    return sorted(pairs, key=lambda x: abs(x[2]), reverse=True)[:5], valid_numeric_cols
 
 
 def classify_dataset(categorical_cols, numeric_cols, all_cols):
@@ -174,6 +186,58 @@ def classify_dataset(categorical_cols, numeric_cols, all_cols):
     return "general"
 
 
+def pick_best_metric_column(numeric_cols, context="General Exploration"):
+    if not numeric_cols:
+        return None
+
+    context_priority = {
+        "Sales Performance": ["sales", "revenue", "amount", "quantity", "price", "profit"],
+        "Customer Retention": ["customer", "revenue", "sales", "count", "frequency", "orders"],
+        "HR Attrition": ["attrition", "income", "salary", "years", "hours", "rate"],
+        "Operational Efficiency": ["time", "hours", "cost", "quantity", "rate", "productivity"],
+        "Financial Performance": ["profit", "revenue", "expense", "cost", "margin", "income"],
+        "General Exploration": BUSINESS_METRIC_KEYWORDS
+    }
+
+    priorities = context_priority.get(context, BUSINESS_METRIC_KEYWORDS)
+
+    for keyword in priorities:
+        for col in numeric_cols:
+            if keyword in col.lower():
+                return col
+
+    bad_fallbacks = {"age", "employeecount", "standardhours"}
+    filtered = [col for col in numeric_cols if col.lower() not in bad_fallbacks]
+    return filtered[0] if filtered else numeric_cols[0]
+
+
+def pick_best_category_column(categorical_cols, context="General Exploration"):
+    if not categorical_cols:
+        return None
+
+    context_priority = {
+        "Sales Performance": ["region", "country", "segment", "category", "product", "customer"],
+        "Customer Retention": ["customer", "segment", "region", "channel", "category"],
+        "HR Attrition": ["department", "jobrole", "gender", "maritalstatus", "overtime", "educationfield"],
+        "Operational Efficiency": ["department", "region", "category", "team", "process"],
+        "Financial Performance": ["region", "department", "category", "segment"],
+        "General Exploration": CATEGORY_PRIORITY_KEYWORDS
+    }
+
+    priorities = context_priority.get(context, CATEGORY_PRIORITY_KEYWORDS)
+
+    for keyword in priorities:
+        for col in categorical_cols:
+            if keyword in col.lower():
+                return col
+
+    return categorical_cols[0]
+
+
+def pick_best_datetime_column(datetime_cols):
+    return datetime_cols[0] if datetime_cols else None
+
+
 def recommend_chart_type(df, x_col, y_col, numeric_cols, categorical_cols, datetime_cols, identifier_cols):
     x_is_numeric = x_col in numeric_cols
     y_is_numeric = y_col in numeric_cols if y_col else False
@@ -182,20 +246,20 @@ def recommend_chart_type(df, x_col, y_col, numeric_cols, categorical_cols, datet
     unique_x = df[x_col].nunique(dropna=True)
 
     if x_is_datetime and y_is_numeric:
-        return "line", "A line chart is best for showing change over time."
+        return "line", "A line chart is best for showing how the selected metric changes over time."
 
     if x_is_numeric and y_is_numeric:
         if x_col in identifier_cols:
-            return "bar_top_n", "This looks like an identifier field, so an aggregated Top N bar chart is more meaningful than a scatter plot."
-        return "scatter", "A scatter plot is best for exploring relationships, clusters, or outliers between two numeric variables."
+            return "bar_top_n", "This looks like an identifier field, so a Top N bar chart is more meaningful than a scatter plot."
+        return "scatter", "A scatter plot is useful for checking relationships, clusters, and unusual values."
 
     if x_is_categorical and y_is_numeric:
         if unique_x <= 12:
-            return "bar", "A bar chart is suitable for comparing a numeric metric across categories."
+            return "bar", "A bar chart is appropriate for comparing a numeric metric across categories."
         return "bar_top_n", "This field has many categories, so a Top N horizontal bar chart improves readability."
 
     if x_is_numeric and not y_col:
-        return "histogram", "A histogram is best for understanding the distribution of a numeric variable."
+        return "histogram", "A histogram helps explain the distribution of a numeric variable."
 
     if x_is_categorical and not y_col:
         if unique_x <= 6:
@@ -281,11 +345,7 @@ def moving_average_projection(df, date_col, value_col, window=7, projection_poin
         avg_diff = date_diffs.mode().iloc[0] if not date_diffs.empty else pd.Timedelta(days=1)
         future_dates = [last_date + avg_diff * (i + 1) for i in range(projection_points)]
     else:
-        future_dates = pd.date_range(
-            start=last_date,
-            periods=projection_points + 1,
-            freq=inferred_freq
-        )[1:]
+        future_dates = pd.date_range(start=last_date, periods=projection_points + 1, freq=inferred_freq)[1:]
 
     last_ma = grouped["moving_avg"].iloc[-1]
     forecast_df = pd.DataFrame({
@@ -297,104 +357,214 @@ def moving_average_projection(df, date_col, value_col, window=7, projection_poin
     actual_df = grouped.copy()
     actual_df["series_type"] = "Actual"
 
-    return pd.concat(
-        [actual_df[[date_col, value_col, "series_type"]], forecast_df],
-        ignore_index=True
-    )
+    return pd.concat([actual_df[[date_col, value_col, "series_type"]], forecast_df], ignore_index=True)
 
 
-def strongest_correlations(df, numeric_cols):
-    valid_numeric_cols = []
-    for col in numeric_cols:
-        clean = pd.to_numeric(df[col], errors="coerce")
-        if clean.nunique(dropna=True) > 1:
-            valid_numeric_cols.append(col)
+# =========================
+# FDE Layer
+# =========================
+def generate_business_findings(df, numeric_cols, categorical_cols, datetime_cols, business_context):
+    findings = []
 
-    if len(valid_numeric_cols) < 2:
-        return [], valid_numeric_cols
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
+    best_category = pick_best_category_column(categorical_cols, business_context)
+    best_date = pick_best_datetime_column(datetime_cols)
 
-    corr = df[valid_numeric_cols].corr(numeric_only=True)
-    pairs = []
+    if best_metric:
+        metric_series = pd.to_numeric(df[best_metric], errors="coerce").dropna()
+        if not metric_series.empty:
+            findings.append(
+                f"The primary metric '{best_metric}' has a total of {metric_series.sum():,.2f} and an average of {metric_series.mean():,.2f}."
+            )
 
-    for i in range(len(corr.columns)):
-        for j in range(i + 1, len(corr.columns)):
-            col1, col2 = corr.columns[i], corr.columns[j]
-            val = corr.iloc[i, j]
-            if pd.notna(val):
-                pairs.append((col1, col2, val))
-
-    return sorted(pairs, key=lambda x: abs(x[2]), reverse=True)[:5], valid_numeric_cols
-
-
-def generate_insights(df, numeric_cols, categorical_cols, datetime_cols):
-    insights = []
-
-    if numeric_cols:
-        for col in numeric_cols[:3]:
-            s = pd.to_numeric(df[col], errors="coerce").dropna()
-            if not s.empty:
-                insights.append(
-                    f"'{col}' has a mean of {s.mean():.2f}, median of {s.median():.2f}, and standard deviation of {s.std():.2f}."
+            outlier_mask = get_outlier_mask(df[best_metric])
+            outlier_count = int(outlier_mask.sum())
+            if outlier_count > 0:
+                findings.append(
+                    f"There are {outlier_count:,} potential anomalies in '{best_metric}', which may distort averages and trend interpretation."
                 )
 
-                outlier_mask = get_outlier_mask(s)
-                outlier_count = int(outlier_mask.sum())
-                if len(s) > 0 and outlier_count > 0:
-                    outlier_pct = outlier_count / len(s) * 100
-                    insights.append(
-                        f"'{col}' contains approximately {outlier_count} potential outliers ({outlier_pct:.1f}% of non-null values)."
-                    )
+    if best_category and best_metric:
+        grouped = (
+            df[[best_category, best_metric]]
+            .dropna()
+            .groupby(best_category)[best_metric]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        if not grouped.empty:
+            top_group = grouped.index[0]
+            top_value = grouped.iloc[0]
+            bottom_group = grouped.index[-1]
+            bottom_value = grouped.iloc[-1]
 
-    if categorical_cols:
-        for col in categorical_cols[:2]:
-            vc = df[col].astype(str).value_counts(dropna=False)
-            if not vc.empty:
-                top_cat = vc.index[0]
-                top_count = vc.iloc[0]
-                insights.append(
-                    f"The most frequent value in '{col}' is '{top_cat}', appearing {top_count:,} times."
-                )
+            findings.append(
+                f"The strongest segment in '{best_category}' is '{top_group}' with {top_value:,.2f} in '{best_metric}', while '{bottom_group}' contributes the least at {bottom_value:,.2f}."
+            )
 
-    if datetime_cols and numeric_cols:
-        date_col = pick_best_datetime_column(datetime_cols)
-        metric_col = pick_best_metric_column(numeric_cols)
-        temp = df[[date_col, metric_col]].dropna().copy()
-        temp[metric_col] = pd.to_numeric(temp[metric_col], errors="coerce")
-        temp = temp.dropna()
+    if best_date and best_metric:
+        trend = (
+            df[[best_date, best_metric]]
+            .dropna()
+            .groupby(best_date)[best_metric]
+            .sum()
+            .sort_index()
+        )
+        if len(trend) >= 2:
+            first_val = trend.iloc[0]
+            last_val = trend.iloc[-1]
+            change_pct = ((last_val - first_val) / first_val * 100) if first_val != 0 else np.nan
+            direction = "increased" if last_val > first_val else "decreased"
 
-        if not temp.empty:
-            trend = temp.groupby(date_col, as_index=False)[metric_col].sum().sort_values(date_col)
-            if len(trend) >= 2:
-                first_val = trend[metric_col].iloc[0]
-                last_val = trend[metric_col].iloc[-1]
-                direction = "increased" if last_val > first_val else "decreased"
-                insights.append(
-                    f"Over the observed time range, '{metric_col}' generally {direction} from {first_val:.2f} to {last_val:.2f}."
-                )
+            findings.append(
+                f"Over time, '{best_metric}' has {direction} from {first_val:,.2f} to {last_val:,.2f}" +
+                (f" ({change_pct:.2f}%)." if pd.notna(change_pct) else ".")
+            )
 
-                peak_row = trend.loc[trend[metric_col].idxmax()]
-                insights.append(
-                    f"The peak value of '{metric_col}' occurred on {peak_row[date_col]} with a total of {peak_row[metric_col]:.2f}."
-                )
-
-    top_corrs, _ = strongest_correlations(df, numeric_cols)
-    if top_corrs:
-        col1, col2, corr_val = top_corrs[0]
-        strength = "strong" if abs(corr_val) >= 0.7 else "moderate" if abs(corr_val) >= 0.4 else "weak"
+    corr_pairs, _ = strongest_correlations(df, numeric_cols)
+    if corr_pairs:
+        col1, col2, corr_val = corr_pairs[0]
         direction = "positive" if corr_val > 0 else "negative"
-        insights.append(
-            f"The strongest detected numeric relationship is a {strength} {direction} correlation between '{col1}' and '{col2}' ({corr_val:.2f})."
+        strength = "strong" if abs(corr_val) >= 0.7 else "moderate" if abs(corr_val) >= 0.4 else "weak"
+        findings.append(
+            f"The strongest measurable relationship is a {strength} {direction} correlation between '{col1}' and '{col2}' ({corr_val:.2f}). This should be investigated as a possible business driver, not treated as proof of causation."
         )
 
-    return insights
+    return findings
 
 
-def generate_executive_summary(df, numeric_cols, categorical_cols, datetime_cols, all_cols):
+def generate_recommendations(df, numeric_cols, categorical_cols, datetime_cols, business_context):
+    recommendations = []
+
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
+    best_category = pick_best_category_column(categorical_cols, business_context)
+    best_date = pick_best_datetime_column(datetime_cols)
+
+    if best_metric:
+        outlier_mask = get_outlier_mask(df[best_metric])
+        outlier_count = int(outlier_mask.sum())
+        if outlier_count > 0:
+            recommendations.append(
+                f"Validate unusual values in '{best_metric}' before taking action, because anomalies may be skewing results."
+            )
+
+    if best_category and best_metric:
+        grouped = (
+            df[[best_category, best_metric]]
+            .dropna()
+            .groupby(best_category)[best_metric]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        if len(grouped) >= 2:
+            recommendations.append(
+                f"Prioritize investigation into lower-performing '{best_category}' groups and compare them against top-performing segments to identify operational or market differences."
+            )
+
+    if best_date and best_metric:
+        trend = (
+            df[[best_date, best_metric]]
+            .dropna()
+            .groupby(best_date)[best_metric]
+            .sum()
+            .sort_index()
+        )
+        if len(trend) >= 2 and trend.iloc[-1] < trend.iloc[0]:
+            recommendations.append(
+                f"The selected metric shows decline over time. Review the period where '{best_metric}' began to soften and investigate whether pricing, demand, staffing, or process changes are linked."
+            )
+
+    if business_context == "Sales Performance":
+        recommendations.append("Focus on the highest-value categories, regions, or products first to protect revenue concentration.")
+        recommendations.append("Review weak-performing segments for pricing, channel, or customer mix issues.")
+    elif business_context == "Customer Retention":
+        recommendations.append("Identify whether revenue is concentrated among a small share of customers and prioritize retention for those segments.")
+        recommendations.append("Track repeat behavior, segment stability, and any drop in order frequency over time.")
+    elif business_context == "HR Attrition":
+        recommendations.append("Investigate whether attrition patterns align with overtime, tenure, compensation, or specific departments.")
+        recommendations.append("Compare high-risk employee groups against lower-risk groups to identify manageable retention levers.")
+    elif business_context == "Operational Efficiency":
+        recommendations.append("Examine cost, time, or productivity outliers to identify process bottlenecks or inconsistent execution.")
+        recommendations.append("Benchmark lower-performing units against stronger units to identify repeatable operational practices.")
+    elif business_context == "Financial Performance":
+        recommendations.append("Separate growth effects from margin effects so that headline improvement is not masking cost pressure.")
+        recommendations.append("Review categories with strong revenue but weak profitability for potential leakage or inefficient spend.")
+    else:
+        recommendations.append("Use the strongest trends, anomalies, and segment differences as the starting point for deeper root-cause analysis.")
+
+    # Remove duplicates while preserving order
+    seen = set()
+    deduped = []
+    for item in recommendations:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+
+    return deduped[:6]
+
+
+def generate_client_story(df, numeric_cols, categorical_cols, datetime_cols, business_context):
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
+    best_category = pick_best_category_column(categorical_cols, business_context)
+    best_date = pick_best_datetime_column(datetime_cols)
+
+    what_happened = "Not enough signal detected to summarize what happened."
+    why_it_matters = "This dataset needs more business context or stronger field coverage."
+    what_to_investigate = "Review data quality, field definitions, and analysis scope."
+    suggested_actions = "Validate the business objective and refine the analysis with a target question."
+
+    if best_metric:
+        metric_series = pd.to_numeric(df[best_metric], errors="coerce").dropna()
+        if not metric_series.empty:
+            what_happened = (
+                f"The dataset suggests that '{best_metric}' is the most decision-relevant measure, with meaningful variation across the records."
+            )
+
+    if best_category and best_metric:
+        grouped = (
+            df[[best_category, best_metric]]
+            .dropna()
+            .groupby(best_category)[best_metric]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        if not grouped.empty:
+            top_group = grouped.index[0]
+            why_it_matters = (
+                f"Performance is not evenly distributed. The strongest contribution comes from '{top_group}', which suggests concentration risk and uneven business performance across '{best_category}'."
+            )
+
+    if best_date and best_metric:
+        trend = (
+            df[[best_date, best_metric]]
+            .dropna()
+            .groupby(best_date)[best_metric]
+            .sum()
+            .sort_index()
+        )
+        if len(trend) >= 2:
+            direction = "improved" if trend.iloc[-1] > trend.iloc[0] else "weakened"
+            what_to_investigate = (
+                f"Investigate when '{best_metric}' {direction} over time and compare that period with category-level shifts, anomalies, or operational changes."
+            )
+
+    suggested_actions = (
+        "Prioritize the main metric, review high- and low-performing segments, validate outliers, and use the resulting pattern differences to guide the next business decision."
+    )
+
+    return {
+        "What happened": what_happened,
+        "Why it matters": why_it_matters,
+        "What to investigate next": what_to_investigate,
+        "Suggested actions": suggested_actions
+    }
+
+
+def generate_executive_summary(df, numeric_cols, categorical_cols, datetime_cols, all_cols, business_context):
     summary = []
-    dataset_type = classify_dataset(categorical_cols, numeric_cols, all_cols)
 
-    best_metric = pick_best_metric_column(numeric_cols)
-    best_category = pick_best_category_column(categorical_cols)
+    best_metric = pick_best_metric_column(numeric_cols, business_context)
+    best_category = pick_best_category_column(categorical_cols, business_context)
     best_date = pick_best_datetime_column(datetime_cols)
 
     if best_date and best_metric:
@@ -412,42 +582,33 @@ def generate_executive_summary(df, numeric_cols, categorical_cols, datetime_cols
     if best_category:
         vc = df[best_category].astype(str).value_counts(dropna=False)
         if not vc.empty:
-            top_group = vc.index[0]
-            top_count = vc.iloc[0]
-
-            if dataset_type == "hr":
-                summary.append(f"👥 Largest employee group in '{best_category}' is '{top_group}' with {top_count:,} records.")
+            if best_metric:
+                grouped = (
+                    df[[best_category, best_metric]]
+                    .dropna()
+                    .groupby(best_category)[best_metric]
+                    .sum()
+                    .sort_values(ascending=False)
+                )
+                if not grouped.empty:
+                    summary.append(f"🏆 Leading '{best_category}' segment is '{grouped.index[0]}' based on total '{best_metric}'.")
             else:
-                if best_metric:
-                    grouped = (
-                        df[[best_category, best_metric]]
-                        .dropna()
-                        .groupby(best_category)[best_metric]
-                        .sum()
-                        .sort_values(ascending=False)
-                    )
-                    if not grouped.empty:
-                        summary.append(
-                            f"🏆 Top '{best_category}' is '{grouped.index[0]}' based on summed '{best_metric}'."
-                        )
-                else:
-                    summary.append(f"🏆 Most frequent value in '{best_category}' is '{top_group}' with {top_count:,} records.")
+                summary.append(f"🏆 Most frequent value in '{best_category}' is '{vc.index[0]}' with {vc.iloc[0]:,} records.")
 
     if best_metric:
         outliers = get_outlier_mask(df[best_metric])
         outlier_count = int(outliers.sum())
         if outlier_count > 0:
-            summary.append(f"⚠️ Detected {outlier_count} anomalies in '{best_metric}', which may skew analysis.")
+            summary.append(f"⚠️ Detected {outlier_count} anomalies in '{best_metric}', which may influence averages and trends.")
         else:
             summary.append(f"✅ No major anomalies detected in '{best_metric}' based on the IQR method.")
 
     corr_pairs, _ = strongest_correlations(df, numeric_cols)
     if corr_pairs:
         c1, c2, val = corr_pairs[0]
-        summary.append(f"🔗 Strong relationship found between '{c1}' and '{c2}' ({val:.2f}).")
+        summary.append(f"🔗 Strongest measurable relationship is between '{c1}' and '{c2}' ({val:.2f}).")
 
-    summary.append("💡 Insights are auto-generated. Validate important findings before making business decisions.")
-
+    summary.append(f"💡 Business context selected: {business_context}. Recommendations below are tailored accordingly.")
     return summary
 
 
@@ -455,27 +616,37 @@ def df_to_csv_download(df):
     return df.to_csv(index=False).encode("utf-8")
 
 
-def text_download(insights, exec_summary):
+def text_download(findings, recommendations, exec_summary, client_story):
     buffer = io.StringIO()
-    buffer.write("AI Analyst Copilot Dashboard - Executive Summary\n")
-    buffer.write("=" * 60 + "\n\n")
+    buffer.write("Client Intelligence Platform - Executive Summary\n")
+    buffer.write("=" * 70 + "\n\n")
     for i, item in enumerate(exec_summary, start=1):
         buffer.write(f"{i}. {item}\n")
 
-    buffer.write("\nAI Analyst Copilot Dashboard - Generated Insights\n")
-    buffer.write("=" * 60 + "\n\n")
-    for i, insight in enumerate(insights, start=1):
-        buffer.write(f"{i}. {insight}\n")
+    buffer.write("\nClient Story\n")
+    buffer.write("=" * 70 + "\n\n")
+    for key, value in client_story.items():
+        buffer.write(f"{key}: {value}\n\n")
+
+    buffer.write("Key Findings\n")
+    buffer.write("=" * 70 + "\n\n")
+    for i, item in enumerate(findings, start=1):
+        buffer.write(f"{i}. {item}\n")
+
+    buffer.write("\nRecommended Focus Areas\n")
+    buffer.write("=" * 70 + "\n\n")
+    for i, item in enumerate(recommendations, start=1):
+        buffer.write(f"{i}. {item}\n")
 
     return buffer.getvalue().encode("utf-8")
 
 
 # =========================
-# Title
+# UI Header
 # =========================
-st.title("AI Analyst Copilot Dashboard")
-st.caption("Upload a CSV or Excel file and get business-focused analysis.")
-st.write("Turn raw data into actionable business insights instantly.")
+st.title("Client Intelligence Platform")
+st.caption("Upload a CSV or Excel file and get business-focused diagnostics, findings, and recommendations.")
+st.write("Turn unfamiliar client data into actionable analysis.")
 
 uploaded_file = st.file_uploader("Upload your file", type=["csv", "xlsx"])
 
@@ -495,15 +666,17 @@ if uploaded_file is not None:
 
     raw_df.columns = [normalize_column_name(col) for col in raw_df.columns]
 
-    df, numeric_cols, categorical_cols, datetime_cols, identifier_cols = detect_column_types(raw_df)
+    df, numeric_cols, categorical_cols, datetime_cols, identifier_cols, datetime_confidence = detect_column_types(raw_df)
 
     st.success("File uploaded successfully.")
-    st.info("The app has automatically detected column types and enabled dynamic analysis for your dataset.")
+    st.info("The platform has automatically profiled the dataset and enabled context-aware analysis.")
 
     # =========================
-    # Sidebar Filters
+    # Sidebar
     # =========================
-    st.sidebar.header("Filters")
+    st.sidebar.header("Analysis Controls")
+    business_context = st.sidebar.selectbox("Business Context", BUSINESS_CONTEXTS, index=0)
+
     filtered_df = df.copy()
 
     if datetime_cols:
@@ -551,7 +724,7 @@ if uploaded_file is not None:
                     ]
 
     selected_outlier_col = None
-    with st.sidebar.expander("Analysis Options", expanded=False):
+    with st.sidebar.expander("Display Options", expanded=False):
         remove_outliers = st.checkbox("Exclude outliers from charts", value=False)
         show_data_preview = st.checkbox("Show filtered data preview", value=True)
         top_n = st.slider("Top N for high-cardinality charts", min_value=5, max_value=25, value=10)
@@ -576,10 +749,6 @@ if uploaded_file is not None:
     c3.metric("Missing Values", f"{missing_count:,}")
     c4.metric("Duplicate Rows", f"{duplicate_count:,}")
 
-    st.caption(
-        f"Rows: {row_count:,} | Columns: {col_count:,} | Missing Values: {missing_count:,} | Duplicate Rows: {duplicate_count:,}"
-    )
-
     # =========================
     # Executive Summary
     # =========================
@@ -589,56 +758,54 @@ if uploaded_file is not None:
         numeric_cols,
         categorical_cols,
         datetime_cols,
-        filtered_df.columns.tolist()
+        filtered_df.columns.tolist(),
+        business_context
     )
 
     for item in exec_summary:
         st.success(item)
 
     # =========================
-    # Data Quality Summary
+    # Client Story
     # =========================
-    with st.expander("Data Quality Summary", expanded=False):
-        quality_df = pd.DataFrame({
-            "column": filtered_df.columns,
-            "dtype": [str(filtered_df[col].dtype) for col in filtered_df.columns],
-            "missing_values": [int(filtered_df[col].isna().sum()) for col in filtered_df.columns],
-            "missing_pct": [round(filtered_df[col].isna().mean() * 100, 2) for col in filtered_df.columns],
-            "unique_values": [int(filtered_df[col].nunique(dropna=True)) for col in filtered_df.columns]
-        })
-        st.dataframe(quality_df, use_container_width=True)
+    st.subheader("Client Story")
+    client_story = generate_client_story(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
 
-        st.write("**Detected Column Groups**")
-        st.write(f"- Numeric measure columns: {numeric_cols if numeric_cols else 'None'}")
-        st.write(f"- Categorical columns: {categorical_cols if categorical_cols else 'None'}")
-        st.write(f"- Datetime columns: {datetime_cols if datetime_cols else 'None'}")
-        st.write(f"- Identifier-like columns: {identifier_cols if identifier_cols else 'None'}")
+    cs1, cs2 = st.columns(2)
+    with cs1:
+        st.info(f"**What happened**\n\n{client_story['What happened']}")
+        st.info(f"**Why it matters**\n\n{client_story['Why it matters']}")
+    with cs2:
+        st.info(f"**What to investigate next**\n\n{client_story['What to investigate next']}")
+        st.info(f"**Suggested actions**\n\n{client_story['Suggested actions']}")
 
     # =========================
-    # Custom Metric
+    # Key Metric Explorer
     # =========================
-    st.subheader("Custom Metric")
+    st.subheader("Key Metric Explorer")
 
     if numeric_cols:
         m1, m2 = st.columns([2, 1])
-        selected_metric_col = m1.selectbox("Choose numeric column", numeric_cols)
+        default_metric = pick_best_metric_column(numeric_cols, business_context)
+        default_metric_index = numeric_cols.index(default_metric) if default_metric in numeric_cols else 0
+        selected_metric_col = m1.selectbox("Choose numeric column", numeric_cols, index=default_metric_index)
         selected_agg = m2.selectbox("Choose aggregation", ["sum", "mean", "median", "min", "max", "count", "std"])
 
         metric_value = compute_metric(filtered_df[selected_metric_col], selected_agg)
-        metric_label = f"{selected_agg.title()} of {selected_metric_col}"
-        st.metric(metric_label, format_number(metric_value))
+        st.metric(f"{selected_agg.title()} of {selected_metric_col}", format_number(metric_value))
         st.caption(f"Exact value: {metric_value}")
     else:
-        st.warning("No numeric measure columns detected for custom metrics.")
+        st.warning("No numeric measure columns detected for metric analysis.")
 
     # =========================
     # Tabs
     # =========================
     tabs = st.tabs([
         "Overview",
-        "Visual Explorer",
-        "Forecast & Trends",
-        "Insights",
+        "Visual Analysis",
+        "Trend Outlook",
+        "Key Findings",
+        "Recommendations",
         "Downloads"
     ])
 
@@ -647,6 +814,25 @@ if uploaded_file is not None:
 
         if show_data_preview:
             st.dataframe(filtered_df.head(20), use_container_width=True)
+
+        with st.expander("Data Quality & Schema", expanded=False):
+            quality_df = pd.DataFrame({
+                "column": filtered_df.columns,
+                "dtype": [str(filtered_df[col].dtype) for col in filtered_df.columns],
+                "missing_values": [int(filtered_df[col].isna().sum()) for col in filtered_df.columns],
+                "missing_pct": [round(filtered_df[col].isna().mean() * 100, 2) for col in filtered_df.columns],
+                "unique_values": [int(filtered_df[col].nunique(dropna=True)) for col in filtered_df.columns],
+                "datetime_parse_confidence_pct": [
+                    datetime_confidence.get(col, np.nan) for col in filtered_df.columns
+                ]
+            })
+            st.dataframe(quality_df, use_container_width=True)
+
+            st.write("**Detected Column Groups**")
+            st.write(f"- Numeric measure columns: {numeric_cols if numeric_cols else 'None'}")
+            st.write(f"- Categorical columns: {categorical_cols if categorical_cols else 'None'}")
+            st.write(f"- Datetime columns: {datetime_cols if datetime_cols else 'None'}")
+            st.write(f"- Identifier-like columns: {identifier_cols if identifier_cols else 'None'}")
 
         left, right = st.columns(2)
 
@@ -677,28 +863,33 @@ if uploaded_file is not None:
                 st.plotly_chart(count_fig, use_container_width=True)
 
     with tabs[1]:
-        st.subheader("Smart Chart Builder")
+        st.subheader("Visual Analysis")
 
         all_x_options = categorical_cols + datetime_cols + identifier_cols + numeric_cols
         all_x_options = list(dict.fromkeys(all_x_options))
 
         if all_x_options:
-            x_col = st.selectbox("Select X-axis / grouping column", all_x_options)
+            default_x = pick_best_category_column(categorical_cols, business_context)
+            if default_x is None and datetime_cols:
+                default_x = datetime_cols[0]
+            if default_x is None:
+                default_x = all_x_options[0]
+
+            default_x_index = all_x_options.index(default_x) if default_x in all_x_options else 0
+            x_col = st.selectbox("Select X-axis / grouping column", all_x_options, index=default_x_index)
         else:
             st.warning("No usable columns found for charting.")
             st.stop()
 
         y_options = ["<None>"] + numeric_cols
-        y_choice = st.selectbox("Select Y-axis / metric column", y_options)
+        default_y = pick_best_metric_column(numeric_cols, business_context)
+        default_y_index = y_options.index(default_y) if default_y in y_options else 0
+        y_choice = st.selectbox("Select Y-axis / metric column", y_options, index=default_y_index)
         y_col = None if y_choice == "<None>" else y_choice
 
         agg_method = "sum"
         if y_col is not None:
-            agg_method = st.selectbox(
-                "Aggregation method",
-                ["sum", "mean", "median", "count"],
-                index=1
-            )
+            agg_method = st.selectbox("Aggregation method", ["sum", "mean", "median", "count"], index=0)
 
         chart_type, chart_reason = recommend_chart_type(
             filtered_df, x_col, y_col, numeric_cols, categorical_cols, datetime_cols, identifier_cols
@@ -706,9 +897,6 @@ if uploaded_file is not None:
 
         st.write(f"**Recommended chart type:** {chart_type.replace('_', ' ').title()}")
         st.caption(chart_reason)
-
-        if y_col and chart_type in ["bar", "bar_top_n"]:
-            st.caption(f"This chart uses **{agg_method}** aggregation for '{y_col}' grouped by '{x_col}'.")
 
         try:
             fig = build_chart(
@@ -724,7 +912,7 @@ if uploaded_file is not None:
             st.error(f"Could not build chart: {e}")
 
     with tabs[2]:
-        st.subheader("Forecast & Trends")
+        st.subheader("Trend Outlook")
 
         if datetime_cols and numeric_cols:
             date_col = st.selectbox("Select datetime column", datetime_cols, key="trend_date")
@@ -743,24 +931,22 @@ if uploaded_file is not None:
                 )
                 st.plotly_chart(trend_fig, use_container_width=True)
                 st.caption(
-                    "This trend view includes a simple moving-average projection. "
-                    "It is useful for directional planning, not for high-stakes forecasting."
+                    "This projection is based on a moving average. It is useful for directional planning and early pattern recognition, not for production-grade forecasting."
                 )
             else:
                 st.warning("Not enough time-series data to create a projection.")
         else:
-            st.info("A trend/projection view requires at least one datetime column and one numeric measure column.")
+            st.info("A trend view requires at least one datetime column and one numeric measure column.")
 
     with tabs[3]:
-        st.subheader("Business Insights")
+        st.subheader("Key Findings")
+        findings = generate_business_findings(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
 
-        generated_insights = generate_insights(filtered_df, numeric_cols, categorical_cols, datetime_cols)
-
-        if generated_insights:
-            for idx, insight in enumerate(generated_insights, start=1):
-                st.info(f"{idx}. {insight}")
+        if findings:
+            for idx, item in enumerate(findings, start=1):
+                st.info(f"{idx}. {item}")
         else:
-            st.warning("Not enough data to generate insights.")
+            st.warning("Not enough data to generate findings.")
 
         st.markdown("### Correlation Heatmap")
         corr_pairs, valid_corr_cols = strongest_correlations(filtered_df, numeric_cols)
@@ -773,12 +959,12 @@ if uploaded_file is not None:
                 title="Interactive Correlation Heatmap"
             )
             st.plotly_chart(heatmap_fig, use_container_width=True)
-            st.caption("This heatmap shows how strongly useful numeric variables are related to each other.")
+            st.caption("These relationships may help identify possible drivers. Correlation alone does not confirm causation.")
         else:
             st.info("Need at least two non-constant numeric columns for correlation analysis.")
 
         if numeric_cols:
-            st.markdown("### Outlier Check")
+            st.markdown("### Outlier Review")
             outlier_col = st.selectbox("Choose numeric column for outlier analysis", numeric_cols, key="outlier_col")
             outlier_mask = get_outlier_mask(filtered_df[outlier_col])
             outlier_count = int(outlier_mask.sum())
@@ -793,9 +979,20 @@ if uploaded_file is not None:
             st.plotly_chart(box_fig, use_container_width=True)
 
     with tabs[4]:
+        st.subheader("Recommended Focus Areas")
+        recommendations = generate_recommendations(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
+
+        if recommendations:
+            for idx, rec in enumerate(recommendations, start=1):
+                st.success(f"{idx}. {rec}")
+        else:
+            st.warning("Not enough signal to generate recommendations.")
+
+    with tabs[5]:
         st.subheader("Downloads")
 
-        generated_insights = generate_insights(filtered_df, numeric_cols, categorical_cols, datetime_cols)
+        findings = generate_business_findings(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
+        recommendations = generate_recommendations(filtered_df, numeric_cols, categorical_cols, datetime_cols, business_context)
 
         st.download_button(
             label="Download Filtered Data (CSV)",
@@ -805,13 +1002,13 @@ if uploaded_file is not None:
         )
 
         st.download_button(
-            label="Download Executive Summary & Insights (TXT)",
-            data=text_download(generated_insights, exec_summary),
-            file_name="executive_summary_and_insights.txt",
+            label="Download Executive Summary, Client Story, Findings & Recommendations (TXT)",
+            data=text_download(findings, recommendations, exec_summary, client_story),
+            file_name="client_intelligence_report.txt",
             mime="text/plain"
         )
 
-        st.write("You can use these exports for reporting, portfolio demos, or sharing analysis outputs.")
+        st.write("These exports can be used for portfolio demos, case-study storytelling, and stakeholder reporting.")
 
 else:
-    st.info("Upload a CSV or Excel file to explore KPIs, trends, chart recommendations, automated insights, and executive summaries.")
+    st.info("Upload a CSV or Excel file to explore KPIs, findings, trends, recommendations, and business context-aware analysis.")

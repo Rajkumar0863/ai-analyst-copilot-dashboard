@@ -915,7 +915,7 @@ A record is flagged if caught by either method. This is broader and more sensiti
             yaxis_title="Count",
             legend=dict(orientation="h")
         )
-        st.plotly_chart(dist_fig, use_container_width=True)
+        st.plotly_chart(dist_fig, use_container_width="Stretch")
 
     with right_col:
         st.markdown("**Anomaly Severity Breakdown**")

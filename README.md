@@ -1,11 +1,11 @@
 # Client Intelligence Platform 
  
-Business-focused analytics dashboard built with Streamlit. 
+AI-powered analytics platform that transforms raw client data into actionable insights. 
  
 ## Features 
-- Upload CSV or Excel files 
+- Upload CSV/XLSX 
 - KPI analysis 
-- Trends and findings 
+- Trends and insights 
 - Business recommendations 
  
 ## Tech Stack 

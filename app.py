@@ -1,6 +1,5 @@
-import io
-from pathlib import Path
-from typing import List, Optional, Tuple
+import json
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -74,16 +73,12 @@ st.markdown(
 def infer_column_types(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str], List[str]]:
     """Return numeric, categorical, datetime, identifier-like columns."""
     working = df.copy()
-    datetime_cols = []
 
     for col in working.columns:
         if working[col].dtype == "object":
             parsed = pd.to_datetime(working[col], errors="coerce")
             if parsed.notna().mean() > 0.7:
                 working[col] = parsed
-                datetime_cols.append(col)
-        elif pd.api.types.is_datetime64_any_dtype(working[col]):
-            datetime_cols.append(col)
 
     numeric_cols = [c for c in working.columns if pd.api.types.is_numeric_dtype(working[c])]
     datetime_cols = [c for c in working.columns if pd.api.types.is_datetime64_any_dtype(working[c])]
@@ -151,7 +146,6 @@ def create_sample_sales_data(rows: int = 500) -> pd.DataFrame:
         }
     )
 
-    # Inject a few realistic data quality issues
     sample_idx = rng.choice(df.index, size=12, replace=False)
     df.loc[sample_idx[:5], "Revenue"] = np.nan
     df.loc[sample_idx[5:8], "Region"] = np.nan
@@ -196,9 +190,7 @@ def compute_data_quality_score(df: pd.DataFrame) -> int:
 
 
 def get_primary_metric(numeric_cols: List[str]) -> Optional[str]:
-    preferred = [
-        "revenue", "sales", "profit", "amount", "value", "orders", "cost", "quantity"
-    ]
+    preferred = ["revenue", "sales", "profit", "amount", "value", "orders", "cost", "quantity"]
     lowered = {c.lower(): c for c in numeric_cols}
     for key in preferred:
         for col_lower, original in lowered.items():
@@ -261,6 +253,258 @@ def worst_category_by_metric(df: pd.DataFrame, cat_cols: List[str], metric: Opti
     return worst_col, worst_category, worst_value if worst_col is not None else None
 
 
+def calculate_metric_trend(df: pd.DataFrame, metric: str, date_col: str) -> Dict[str, Optional[float]]:
+    temp = df[[date_col, metric]].dropna().copy()
+    if temp.empty:
+        return {"pct_change": None, "direction": None, "monthly": None}
+
+    temp = temp.sort_values(date_col)
+    temp["period"] = temp[date_col].dt.to_period("M").astype(str)
+    monthly = temp.groupby("period")[metric].sum(numeric_only=True)
+    if len(monthly) < 2:
+        return {"pct_change": None, "direction": None, "monthly": monthly}
+
+    first_val = monthly.iloc[0]
+    last_val = monthly.iloc[-1]
+    if first_val == 0:
+        return {"pct_change": None, "direction": None, "monthly": monthly}
+
+    pct_change = ((last_val - first_val) / abs(first_val)) * 100
+    direction = "up" if pct_change >= 0 else "down"
+    return {"pct_change": float(pct_change), "direction": direction, "monthly": monthly}
+
+
+def get_strongest_correlation(df: pd.DataFrame, numeric_cols: List[str]) -> Optional[Tuple[str, str, float]]:
+    if len(numeric_cols) < 2:
+        return None
+    corr = df[numeric_cols].corr(numeric_only=True)
+    if corr.empty:
+        return None
+    pairs = corr.where(~np.eye(corr.shape[0], dtype=bool)).stack().sort_values(key=lambda s: s.abs(), ascending=False)
+    if pairs.empty:
+        return None
+    a, b = pairs.index[0]
+    return str(a), str(b), float(pairs.iloc[0])
+
+
+def get_outlier_signal(df: pd.DataFrame, numeric_cols: List[str]) -> Optional[Tuple[str, float]]:
+    best_col = None
+    best_rate = 0.0
+    for col in numeric_cols:
+        series = df[col].dropna()
+        if len(series) < 8:
+            continue
+        q1, q3 = series.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        if iqr == 0:
+            continue
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        outlier_rate = ((series < lower) | (series > upper)).mean()
+        if outlier_rate > best_rate:
+            best_rate = float(outlier_rate)
+            best_col = col
+    if best_col is None:
+        return None
+    return best_col, best_rate
+
+
+def classify_insight(insight: str) -> str:
+    text = insight.lower()
+    if any(word in text for word in ["missing", "duplicate", "risk", "outlier", "decline", "drop", "weak", "imbalance"]):
+        return "risk"
+    if any(word in text for word in ["recommend", "focus", "investigate", "prioritize", "review", "protect"]):
+        return "recommendation"
+    if any(word in text for word in ["correlation", "trend", "increase", "decrease", "grew", "improved", "strongest"]):
+        return "trend"
+    return "general"
+
+
+def agreement_label(score: float) -> str:
+    if score >= 80:
+        return "High"
+    if score >= 60:
+        return "Medium"
+    return "Low"
+
+
+def insight_keywords(text: str) -> set:
+    stopwords = {
+        "the", "a", "an", "and", "or", "to", "of", "in", "for", "by", "with", "is", "are", "was", "were",
+        "this", "that", "from", "on", "as", "it", "be", "at", "into", "across", "than", "may", "can", "should"
+    }
+    cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
+    tokens = {tok for tok in cleaned.split() if len(tok) > 2 and tok not in stopwords}
+    return tokens
+
+
+def score_insight(insight: str, primary_metric: Optional[str], peer_insights: List[str], cat_cols: List[str], dt_cols: List[str]) -> Dict[str, float]:
+    text = insight.lower()
+
+    relevance = 45.0
+    if primary_metric and primary_metric.lower() in text:
+        relevance += 30
+    if any(col.lower() in text for col in cat_cols[:3]):
+        relevance += 10
+    if any(col.lower() in text for col in dt_cols[:2]):
+        relevance += 10
+    relevance = min(relevance, 100)
+
+    actionability = 35.0
+    if any(word in text for word in ["recommend", "investigate", "review", "prioritize", "focus", "protect", "improve"]):
+        actionability += 45
+    if any(word in text for word in ["risk", "decline", "drop", "weak", "underperformance"]):
+        actionability += 10
+    actionability = min(actionability, 100)
+
+    clarity = 40.0
+    word_count = len(insight.split())
+    if 12 <= word_count <= 32:
+        clarity += 30
+    if "." in insight or "," in insight:
+        clarity += 10
+    if any(word in text for word in ["because", "suggests", "indicates", "appears"]):
+        clarity += 15
+    clarity = min(clarity, 100)
+
+    current_keywords = insight_keywords(insight)
+    consistency_values = []
+    for peer in peer_insights:
+        peer_keywords = insight_keywords(peer)
+        union = current_keywords | peer_keywords
+        if not union:
+            continue
+        overlap = len(current_keywords & peer_keywords) / len(union)
+        consistency_values.append(overlap)
+    consistency = (float(np.mean(consistency_values)) * 100) if consistency_values else 40.0
+
+    total = round(relevance * 0.4 + actionability * 0.3 + consistency * 0.2 + clarity * 0.1, 1)
+    return {
+        "relevance": round(relevance, 1),
+        "actionability": round(actionability, 1),
+        "consistency": round(consistency, 1),
+        "clarity": round(clarity, 1),
+        "total": total,
+    }
+
+
+def generate_rule_based_insights(df: pd.DataFrame, primary_metric: Optional[str], cat_cols: List[str], dt_cols: List[str]) -> List[str]:
+    insights = []
+
+    missing_cells = int(df.isna().sum().sum())
+    duplicates = int(df.duplicated().sum())
+    if missing_cells > 0:
+        insights.append(f"Data quality risk detected: the dataset contains {missing_cells:,} missing values that may affect reporting accuracy.")
+    if duplicates > 0:
+        insights.append(f"Duplicate record risk detected: {duplicates:,} duplicate rows should be reviewed before external reporting.")
+
+    if primary_metric and cat_cols:
+        best_col, best_cat, best_val = top_category_by_metric(df, cat_cols, primary_metric)
+        worst_col, worst_cat, worst_val = worst_category_by_metric(df, cat_cols, primary_metric)
+        if best_col and best_cat is not None:
+            insights.append(f"The strongest driver of {primary_metric} is {best_cat} within {best_col}, contributing {best_val:,.2f} overall.")
+        if worst_col and worst_cat is not None:
+            insights.append(f"Underperformance appears in {worst_cat} under {worst_col}, making it a priority area for review.")
+
+    if primary_metric and dt_cols:
+        trend = calculate_metric_trend(df, primary_metric, dt_cols[0])
+        if trend["pct_change"] is not None:
+            direction_word = "improved" if trend["pct_change"] >= 0 else "declined"
+            insights.append(f"Over time, {primary_metric} has {direction_word} by {abs(trend['pct_change']):.1f}% from the first month to the latest month.")
+
+    return insights[:4]
+
+
+def generate_statistical_insights(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str], dt_cols: List[str], primary_metric: Optional[str]) -> List[str]:
+    insights = []
+
+    corr = get_strongest_correlation(df, numeric_cols)
+    if corr:
+        a, b, val = corr
+        relation = "positive" if val >= 0 else "negative"
+        insights.append(f"The strongest statistical relationship is a {relation} correlation of {val:.2f} between {a} and {b}.")
+
+    outlier_signal = get_outlier_signal(df, numeric_cols)
+    if outlier_signal:
+        col, rate = outlier_signal
+        insights.append(f"Outlier analysis shows that {col} has the highest anomaly concentration at {rate:.1%}, which may distort averages and trends.")
+
+    if primary_metric and dt_cols:
+        trend = calculate_metric_trend(df, primary_metric, dt_cols[0])
+        monthly = trend.get("monthly")
+        if monthly is not None and len(monthly) >= 3:
+            recent = monthly.tail(3).values
+            if len(recent) == 3:
+                slope = recent[-1] - recent[0]
+                direction = "upward" if slope >= 0 else "downward"
+                insights.append(f"Recent monthly movement for {primary_metric} shows a {direction} direction across the latest observed periods.")
+
+    if cat_cols and primary_metric:
+        grouped = df.groupby(cat_cols[0], dropna=False)[primary_metric].sum(numeric_only=True)
+        if not grouped.empty:
+            spread = grouped.max() - grouped.min()
+            insights.append(f"Category spread analysis indicates a {spread:,.2f} gap between the strongest and weakest values in {cat_cols[0]}." )
+
+    return insights[:4]
+
+
+def generate_narrative_insights(df: pd.DataFrame, primary_metric: Optional[str], cat_cols: List[str], dt_cols: List[str], quality_score: int) -> List[str]:
+    insights = []
+
+    if primary_metric and dt_cols:
+        trend = calculate_metric_trend(df, primary_metric, dt_cols[0])
+        if trend["pct_change"] is not None:
+            if trend["pct_change"] >= 0:
+                insights.append(f"Narrative assessment suggests momentum is favorable because {primary_metric} is trending upward over time, which may indicate healthy commercial performance.")
+            else:
+                insights.append(f"Narrative assessment suggests caution because {primary_metric} is trending downward over time, which may reflect weakening demand, execution gaps, or retention issues.")
+
+    if cat_cols and primary_metric:
+        best_col, best_cat, _ = top_category_by_metric(df, cat_cols, primary_metric)
+        worst_col, worst_cat, _ = worst_category_by_metric(df, cat_cols, primary_metric)
+        if best_col and best_cat:
+            insights.append(f"From a business perspective, {best_cat} in {best_col} appears to be a dependable growth segment that should be protected and scaled.")
+        if worst_col and worst_cat:
+            insights.append(f"The weakest segment appears to be {worst_cat} in {worst_col}, suggesting a need for targeted investigation and intervention.")
+
+    if quality_score < 75:
+        insights.append(f"Decision confidence should be moderated because the current data quality score is {quality_score}/100, indicating reporting and interpretation risk.")
+    else:
+        insights.append(f"Decision confidence is relatively strong because the data quality score is {quality_score}/100, supporting more reliable interpretation.")
+
+    return insights[:4]
+
+
+def build_evaluation_table(engine_outputs: Dict[str, List[str]], primary_metric: Optional[str], cat_cols: List[str], dt_cols: List[str]) -> pd.DataFrame:
+    rows = []
+    all_entries = []
+    for engine, insights in engine_outputs.items():
+        for insight in insights:
+            all_entries.append((engine, insight))
+
+    for engine, insight in all_entries:
+        peer_texts = [text for e, text in all_entries if text != insight]
+        scores = score_insight(insight, primary_metric, peer_texts, cat_cols, dt_cols)
+        rows.append(
+            {
+                "Engine": engine,
+                "Insight Type": classify_insight(insight).title(),
+                "Insight": insight,
+                "Relevance": scores["relevance"],
+                "Actionability": scores["actionability"],
+                "Consistency": scores["consistency"],
+                "Clarity": scores["clarity"],
+                "Total Score": scores["total"],
+                "Agreement": agreement_label(scores["consistency"]),
+            }
+        )
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values(["Total Score", "Engine"], ascending=[False, True]).reset_index(drop=True)
+    return result
+
+
 def generate_executive_summary(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str], dt_cols: List[str]) -> str:
     if df.empty:
         return "No data is available to generate an executive summary."
@@ -278,24 +522,16 @@ def generate_executive_summary(df: pd.DataFrame, numeric_cols: List[str], cat_co
         summary_parts.append(f"The primary business metric appears to be **{metric}**, with a total value of **{metric_total:,.2f}**.")
 
     if date_col and metric:
-        temp = df[[date_col, metric]].dropna().copy()
-        if not temp.empty:
-            temp = temp.sort_values(date_col)
-            temp["period"] = temp[date_col].dt.to_period("M").astype(str)
-            monthly = temp.groupby("period")[metric].sum(numeric_only=True)
-            if len(monthly) >= 2:
-                first_val = monthly.iloc[0]
-                last_val = monthly.iloc[-1]
-                if first_val != 0:
-                    pct = ((last_val - first_val) / abs(first_val)) * 100
-                    trend_word = "improved" if pct >= 0 else "declined"
-                    summary_parts.append(
-                        f"Over time, **{metric}** has **{trend_word} by {abs(pct):.1f}%** from the first observed month to the latest one."
-                    )
+        trend = calculate_metric_trend(df, metric, date_col)
+        if trend["pct_change"] is not None:
+            trend_word = "improved" if trend["pct_change"] >= 0 else "declined"
+            summary_parts.append(
+                f"Over time, **{metric}** has **{trend_word} by {abs(trend['pct_change']):.1f}%** from the first observed month to the latest one."
+            )
 
     if cat_cols and metric:
         best_col, best_cat, best_val = top_category_by_metric(df, cat_cols, metric)
-        worst_col, worst_cat, worst_val = worst_category_by_metric(df, cat_cols, metric)
+        worst_col, worst_cat, _ = worst_category_by_metric(df, cat_cols, metric)
         if best_col and best_cat is not None:
             summary_parts.append(
                 f"The strongest contribution comes from **{best_cat}** in **{best_col}**, contributing **{best_val:,.2f}** to {metric}."
@@ -390,7 +626,7 @@ def generate_recommendations(df: pd.DataFrame, numeric_cols: List[str], cat_cols
     return recs[:5]
 
 
-def choose_chart(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str], dt_cols: List[str]) -> Tuple[Optional[px.scatter], str]:
+def choose_chart(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str], dt_cols: List[str]):
     metric = get_primary_metric(numeric_cols)
     date_col = get_primary_datetime(dt_cols)
 
@@ -421,7 +657,7 @@ def choose_chart(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str],
     return None, "No recommended chart could be generated because no suitable numeric field was found."
 
 
-def make_download_report(df: pd.DataFrame, summary: str, risks: List[Tuple[str, str]], recs: List[str], quality_score: int) -> pd.DataFrame:
+def make_download_report(summary: str, risks: List[Tuple[str, str]], recs: List[str], quality_score: int, evaluation_df: pd.DataFrame) -> pd.DataFrame:
     rows = [
         {"Section": "Executive Summary", "Detail": summary},
         {"Section": "Data Quality Score", "Detail": quality_score},
@@ -430,6 +666,9 @@ def make_download_report(df: pd.DataFrame, summary: str, risks: List[Tuple[str, 
         rows.append({"Section": f"Risk Alert ({level.title()})", "Detail": msg})
     for idx, rec in enumerate(recs, start=1):
         rows.append({"Section": f"Recommendation {idx}", "Detail": rec})
+    if not evaluation_df.empty:
+        top = evaluation_df.iloc[0]
+        rows.append({"Section": "Top Insight Engine", "Detail": f"{top['Engine']} with score {top['Total Score']}"})
     return pd.DataFrame(rows)
 
 
@@ -447,15 +686,19 @@ def render_risk_box(level: str, message: str) -> None:
 # =========================
 st.markdown('<div class="main-title">Client Intelligence Platform</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitle">Upload a CSV/XLSX file or try demo mode to generate KPI dashboards, trend analysis, anomaly detection, and decision-focused business recommendations.</div>',
+    '<div class="subtitle">Upload a CSV/XLSX file or try demo mode to generate KPI dashboards, trend analysis, anomaly detection, recommendations, and multi-engine insight evaluation.</div>',
     unsafe_allow_html=True,
 )
 
 intro1, intro2, intro3, intro4 = st.columns(4)
-intro1.info("**Business Problem**\nTeams often receive raw data with little clarity on what matters most.")
-intro2.info("**What this platform does**\nConverts raw data into summaries, KPIs, charts, risks, and actions.")
-intro3.info("**Who it is for**\nAnalysts, consultants, managers, and non-technical business users.")
-intro4.info("**How to use it**\nUpload a file or choose demo mode, then filter and review insights.")
+intro1.info("**Business Problem**
+Teams often receive raw data with little clarity on what matters most.")
+intro2.info("**What this platform does**
+Converts raw data into summaries, KPIs, charts, risks, and actions.")
+intro3.info("**Research Upgrade**
+Compares rule-based, statistical, and narrative insight engines side by side.")
+intro4.info("**How to use it**
+Upload a file or choose demo mode, then filter and review insights.")
 
 st.markdown("---")
 
@@ -582,6 +825,43 @@ st.markdown("---")
 
 
 # =========================
+# Evaluation layer
+# =========================
+st.subheader("Insight Evaluation Layer")
+st.caption("This research-style section compares how different reasoning engines generate and score insights from the same dataset.")
+
+engine_outputs = {
+    "Rule-Based Engine": generate_rule_based_insights(filtered_df, primary_metric, categorical_cols, datetime_cols),
+    "Statistical Engine": generate_statistical_insights(filtered_df, numeric_cols, categorical_cols, datetime_cols, primary_metric),
+    "Narrative Engine": generate_narrative_insights(filtered_df, primary_metric, categorical_cols, datetime_cols, quality_score),
+}
+
+evaluation_df = build_evaluation_table(engine_outputs, primary_metric, categorical_cols, datetime_cols)
+
+engine_tabs = st.tabs(list(engine_outputs.keys()))
+for tab, (engine_name, insights) in zip(engine_tabs, engine_outputs.items()):
+    with tab:
+        if insights:
+            for idx, insight in enumerate(insights, start=1):
+                st.markdown(f"**{idx}.** {insight}")
+        else:
+            st.info("This engine did not generate enough evidence-based insights for the current dataset.")
+
+st.markdown("### Comparison Table")
+st.dataframe(evaluation_df, width="stretch", hide_index=True)
+
+if not evaluation_df.empty:
+    avg_scores = evaluation_df.groupby("Engine")["Total Score"].mean().reset_index()
+    avg_fig = px.bar(avg_scores, x="Engine", y="Total Score", title="Average Insight Score by Engine")
+    st.plotly_chart(avg_fig, width="stretch")
+
+    top_engine = avg_scores.sort_values("Total Score", ascending=False).iloc[0]
+    st.success(f"Top-performing engine in the current run: **{top_engine['Engine']}** with an average score of **{top_engine['Total Score']:.1f}**.")
+
+st.markdown("---")
+
+
+# =========================
 # Recommended chart + additional visuals
 # =========================
 st.subheader("Recommended Visualization")
@@ -626,11 +906,12 @@ st.markdown("---")
 st.subheader("Preview Data")
 st.dataframe(filtered_df.head(100), width="stretch")
 
-report_df = make_download_report(filtered_df, summary, risks, recommendations, quality_score)
+report_df = make_download_report(summary, risks, recommendations, quality_score, evaluation_df)
 report_csv = dataframe_to_csv_bytes(report_df)
 filtered_csv = dataframe_to_csv_bytes(filtered_df)
+evaluation_csv = dataframe_to_csv_bytes(evaluation_df) if not evaluation_df.empty else b""
 
-export1, export2 = st.columns(2)
+export1, export2, export3 = st.columns(3)
 export1.download_button(
     "Download filtered dataset as CSV",
     data=filtered_csv,
@@ -643,8 +924,15 @@ export2.download_button(
     file_name="client_intelligence_insights_report.csv",
     mime="text/csv",
 )
+export3.download_button(
+    "Download evaluation table as CSV",
+    data=evaluation_csv,
+    file_name="insight_evaluation_table.csv",
+    mime="text/csv",
+    disabled=evaluation_df.empty,
+)
 
 st.markdown("---")
 st.caption(
-    "Future enhancement ideas: PDF export, AI-generated narrative insights, authentication, multi-file analysis, and monitoring dashboards."
+    "Next research upgrade: replace the Narrative Engine with a real LLM-backed engine and compare prompt outputs against rule-based and statistical baselines."
 )

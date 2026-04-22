@@ -1,9 +1,10 @@
 import os
 import io
+import re
 import json
 import math
 import textwrap
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,249 +13,524 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
-# -----------------------------
-# ENV SETUP
-# -----------------------------
-load_dotenv()
-
+# Optional Gemini import
 try:
     import google.generativeai as genai
+    GEMINI_AVAILABLE = True
 except Exception:
-    genai = None
+    GEMINI_AVAILABLE = False
 
-# -----------------------------
+load_dotenv()
+
+
+# =========================
 # PAGE CONFIG
-# -----------------------------
+# =========================
 st.set_page_config(
     page_title="Client Intelligence Platform",
-    layout="wide",
+    page_icon="📊",
+    layout="wide"
 )
 
-# -----------------------------
+
+# =========================
 # STYLING
-# -----------------------------
-st.markdown(
-    """
-    <style>
-    .main-card {
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 16px;
-        padding: 18px;
-        background-color: rgba(255,255,255,0.02);
-        margin-bottom: 16px;
-    }
-    .metric-card {
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 16px;
-        padding: 18px;
-        background-color: rgba(255,255,255,0.01);
-        min-height: 120px;
-    }
-    .section-gap {
-        margin-top: 18px;
-        margin-bottom: 6px;
-    }
-    .tiny-muted {
-        color: #9aa4b2;
-        font-size: 0.9rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# =========================
+CUSTOM_CSS = """
+<style>
+.block-container {
+    padding-top: 1.3rem;
+    padding-bottom: 2rem;
+}
+.metric-card {
+    padding: 1rem;
+    border-radius: 14px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+}
+.section-card {
+    padding: 1rem 1.2rem;
+    border-radius: 16px;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.08);
+}
+.small-muted {
+    opacity: 0.75;
+    font-size: 0.95rem;
+}
+.good-box {
+    padding: 0.9rem 1rem;
+    border-radius: 12px;
+    background: rgba(0, 180, 100, 0.18);
+    border: 1px solid rgba(0, 180, 100, 0.4);
+}
+.warn-box {
+    padding: 0.9rem 1rem;
+    border-radius: 12px;
+    background: rgba(255, 170, 0, 0.12);
+    border: 1px solid rgba(255, 170, 0, 0.35);
+}
+.info-box {
+    padding: 0.9rem 1rem;
+    border-radius: 12px;
+    background: rgba(80, 160, 255, 0.12);
+    border: 1px solid rgba(80, 160, 255, 0.35);
+}
+h1, h2, h3 {
+    letter-spacing: 0.2px;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# -----------------------------
+
+# =========================
 # HELPERS
-# -----------------------------
-def safe_read_file(uploaded_file) -> pd.DataFrame:
-    if uploaded_file is None:
-        return pd.DataFrame()
-
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    elif name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded_file)
-    else:
-        return pd.DataFrame()
+# =========================
+def normalize_colname(col: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(col).strip().lower()).strip("_")
 
 
-def make_demo_sales_dataset() -> pd.DataFrame:
-    # FIXED: use lowercase "h", not "H"
-    dates = pd.date_range("2009-12-01", "2010-12-09", freq="h")
+def safe_label(col: str) -> str:
+    return str(col).replace("_", " ").strip().title()
 
-    np.random.seed(42)
-    n = 1200
 
-    chosen_dates = np.random.choice(dates, n)
+def try_parse_datetime(series: pd.Series) -> pd.Series:
+    try:
+        parsed = pd.to_datetime(series, errors="coerce")
+        if parsed.notna().sum() >= max(3, int(len(series) * 0.4)):
+            return parsed
+        return series
+    except Exception:
+        return series
 
-    countries = [
-        "United Kingdom", "Ireland", "Germany", "France",
-        "Spain", "Netherlands", "Sweden", "Switzerland", "Australia"
+
+def readable_value(x: Any) -> str:
+    if pd.isna(x):
+        return "N/A"
+    if isinstance(x, (int, np.integer)):
+        return f"{int(x):,}"
+    if isinstance(x, (float, np.floating)):
+        if abs(x) >= 1000:
+            return f"{x:,.2f}"
+        return f"{x:.2f}"
+    return str(x)
+
+
+def detect_column_roles(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    roles: Dict[str, Dict[str, Any]] = {}
+
+    id_keywords = [
+        "id", "uuid", "sku", "invoice", "order_id", "transaction_id",
+        "customer_id", "product_id", "session_id", "row_id", "ref", "code"
     ]
-    categories = ["cosmetics", "fashion", "electronics", "food"]
-    genders = ["Male", "Female", "Non-binary", "Unknown"]
-    device_types = ["Mobile", "Desktop", "Tablet"]
-    subscription_types = ["Basic", "Premium", "Student", "Family"]
-    suppliers = [f"Supplier {i}" for i in range(1, 8)]
-    carriers = ["DHL", "FedEx", "UPS", "Royal Mail"]
-    locations = ["London", "Dublin", "Berlin", "Paris", "Madrid", "Amsterdam"]
+    time_keywords = ["date", "time", "timestamp", "datetime", "month", "year", "week", "day"]
+    geo_keywords = ["country", "region", "state", "city", "location", "market", "territory"]
+    business_segment_keywords = [
+        "category", "segment", "channel", "platform", "campaign", "campaign_type",
+        "industry", "supplier", "vendor", "brand", "product_type", "subscription",
+        "gender", "demographic", "device", "plan", "carrier", "artist", "album",
+        "playlist", "genre", "product", "department"
+    ]
+    macro_keywords = ["population", "gdp", "inflation", "macro", "cpi", "economy"]
+    numeric_metric_keywords = [
+        "sales", "revenue", "profit", "cost", "spend", "ctr", "cpc", "cpa",
+        "roas", "conversion", "conversions", "click", "clicks", "impression",
+        "impressions", "quantity", "units", "price", "lead_time", "shipping",
+        "stock", "availability", "volume", "streams", "followers", "likes",
+        "rating", "duration", "hours", "minutes"
+    ]
 
-    df = pd.DataFrame({
-        "order_datetime": pd.to_datetime(chosen_dates),
-        "Product type": np.random.choice(categories, n, p=[0.35, 0.25, 0.25, 0.15]),
-        "SKU": [f"SKU{i}" for i in range(n)],
-        "Price": np.round(np.random.uniform(2, 100, n), 4),
-        "Availability": np.random.randint(1, 100, n),
-        "Number of products sold": np.random.randint(10, 1000, n),
-        "Revenue generated": np.round(np.random.uniform(1000, 10000, n), 4),
-        "Customer demographics": np.random.choice(genders, n),
-        "Stock levels": np.random.randint(1, 100, n),
-        "Lead times": np.random.randint(1, 30, n),
-        "Order quantities": np.random.randint(1, 100, n),
-        "Shipping times": np.random.randint(1, 25, n),
-        "Shipping carriers": np.random.choice(carriers, n),
-        "Shipping costs": np.round(np.random.uniform(5, 200, n), 4),
-        "Supplier name": np.random.choice(suppliers, n),
-        "Location": np.random.choice(locations, n),
-        "Lead time": np.random.randint(1, 20, n),
-        "Production volumes": np.random.randint(100, 5000, n),
-        "Manufacturing lead time": np.random.randint(5, 40, n),
-        "Manufacturing costs": np.round(np.random.uniform(100, 5000, n), 4),
-        "Inspection results": np.random.choice(["Pass", "Fail"], n, p=[0.9, 0.1]),
-        "Defect rates": np.round(np.random.uniform(0, 0.2, n), 4),
-        "Costs": np.round(np.random.uniform(50, 6000, n), 4),
-        "Country": np.random.choice(countries, n, p=[0.35, 0.12, 0.1, 0.1, 0.08, 0.08, 0.06, 0.06, 0.05]),
-    })
+    for col in df.columns:
+        col_norm = normalize_colname(col)
+        series = df[col]
+        unique_ratio = series.nunique(dropna=True) / max(len(series), 1)
 
+        role = {
+            "normalized": col_norm,
+            "is_numeric": pd.api.types.is_numeric_dtype(series),
+            "is_datetime": pd.api.types.is_datetime64_any_dtype(series),
+            "is_identifier": False,
+            "is_time": False,
+            "is_geo": False,
+            "is_business_segment": False,
+            "is_macro": False,
+            "is_metric": False,
+            "is_candidate_segment": False,
+        }
+
+        if any(k in col_norm for k in id_keywords):
+            role["is_identifier"] = True
+
+        if not role["is_numeric"] and unique_ratio > 0.85 and series.nunique(dropna=True) > 20:
+            role["is_identifier"] = True
+
+        if role["is_datetime"] or any(k in col_norm for k in time_keywords):
+            role["is_time"] = True
+
+        if any(k in col_norm for k in geo_keywords):
+            role["is_geo"] = True
+
+        if any(k in col_norm for k in business_segment_keywords):
+            role["is_business_segment"] = True
+
+        if any(k in col_norm for k in macro_keywords):
+            role["is_macro"] = True
+
+        if role["is_numeric"] and any(k in col_norm for k in numeric_metric_keywords):
+            role["is_metric"] = True
+
+        if (
+            not role["is_numeric"]
+            and not role["is_identifier"]
+            and not role["is_time"]
+            and series.nunique(dropna=True) >= 2
+            and series.nunique(dropna=True) <= min(30, max(10, len(df) // 2))
+        ):
+            if role["is_business_segment"] or role["is_geo"]:
+                role["is_candidate_segment"] = True
+            else:
+                role["is_candidate_segment"] = unique_ratio < 0.6
+
+        roles[col] = role
+
+    return roles
+
+
+def get_safe_segment_columns(df: pd.DataFrame, column_roles: Dict[str, Dict[str, Any]]) -> List[str]:
+    hard_block = ["id", "sku", "invoice", "code", "uuid", "transaction", "customer_id", "product_id"]
+    safe_cols = []
+    for col, role in column_roles.items():
+        col_norm = normalize_colname(col)
+        if any(h in col_norm for h in hard_block):
+            continue
+        if role["is_candidate_segment"]:
+            safe_cols.append(col)
+    return safe_cols
+
+
+def get_safe_metric_columns(df: pd.DataFrame, column_roles: Dict[str, Dict[str, Any]]) -> List[str]:
+    safe_metrics = []
+    for col, role in column_roles.items():
+        if role["is_numeric"] and not role["is_identifier"]:
+            safe_metrics.append(col)
+    return safe_metrics
+
+
+def choose_primary_metric(df: pd.DataFrame, safe_metric_cols: List[str]) -> Optional[str]:
+    preferred_metric_names = [
+        "revenue", "sales", "sales_amount", "sales_amount_gbp",
+        "revenue_generated", "profit", "roas", "conversions",
+        "streams", "listeners", "engagement", "watch_time"
+    ]
+
+    for col in df.columns:
+        col_norm = normalize_colname(col)
+        if pd.api.types.is_numeric_dtype(df[col]):
+            if any(name in col_norm for name in preferred_metric_names):
+                return col
+
+    if safe_metric_cols:
+        return safe_metric_cols[0]
+    return None
+
+
+def choose_best_segment_column(df: pd.DataFrame, candidate_cols: List[str], metric_col: str) -> Optional[str]:
+    if metric_col not in df.columns:
+        return None
+
+    scored = []
+    for col in candidate_cols:
+        try:
+            nunique = df[col].nunique(dropna=True)
+            if nunique < 2:
+                continue
+
+            grouped = df.groupby(col, dropna=False)[metric_col].sum().sort_values(ascending=False)
+            if grouped.empty or grouped.sum() == 0:
+                continue
+
+            top_share = grouped.iloc[0] / grouped.sum()
+            cardinality_penalty = abs(nunique - 5)
+
+            score = 100
+            score -= cardinality_penalty * 3
+
+            if top_share > 0.95:
+                score -= 40
+            elif top_share > 0.85:
+                score -= 20
+
+            score += min(len(grouped), 10)
+            scored.append((col, score))
+        except Exception:
+            continue
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[0][0]
+
+
+def summarize_strongest_and_weakest_segment(df: pd.DataFrame, segment_col: str, metric_col: str) -> Optional[Dict[str, Any]]:
+    try:
+        grouped = df.groupby(segment_col, dropna=False)[metric_col].sum().sort_values(ascending=False)
+        if grouped.empty or len(grouped) < 2:
+            return None
+
+        return {
+            "segment_col": segment_col,
+            "strongest_name": str(grouped.index[0]),
+            "strongest_value": float(grouped.iloc[0]),
+            "weakest_name": str(grouped.index[-1]),
+            "weakest_value": float(grouped.iloc[-1]),
+        }
+    except Exception:
+        return None
+
+
+def detect_dataset_type(df: pd.DataFrame) -> str:
+    cols = [normalize_colname(c) for c in df.columns]
+    joined = " ".join(cols)
+
+    if any(k in joined for k in ["ctr", "roas", "campaign", "click", "impression", "cpc", "cpa"]):
+        return "marketing"
+    if any(k in joined for k in ["supplier", "shipping", "stock", "lead_time", "manufacturing"]):
+        return "supply_chain"
+    if any(k in joined for k in ["invoice", "product", "quantity", "sales_amount", "revenue_generated"]):
+        return "ecommerce"
+    if any(k in joined for k in ["artist", "album", "genre", "playlist", "streams"]):
+        return "media"
+    if any(k in joined for k in ["subscription", "device", "watch_time", "country", "gender"]):
+        return "subscription"
+    return "general"
+
+
+def read_uploaded_file(file) -> pd.DataFrame:
+    name = file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(file)
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(file)
+    raise ValueError("Unsupported file format. Please upload CSV or Excel.")
+
+
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    for col in df.columns:
+        if df[col].dtype == "object":
+            parsed = try_parse_datetime(df[col])
+            if pd.api.types.is_datetime64_any_dtype(parsed):
+                df[col] = parsed
+
+    for col in df.select_dtypes(include="object").columns:
+        sample = df[col].dropna().astype(str).head(100)
+        if len(sample) > 0:
+            numeric_like = sample.str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+            success_rate = pd.to_numeric(numeric_like, errors="coerce").notna().mean()
+            if success_rate > 0.8:
+                df[col] = pd.to_numeric(
+                    df[col].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
+                    errors="coerce"
+                )
     return df
 
 
-def detect_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for col in out.columns:
-        if out[col].dtype == "object":
-            try:
-                parsed = pd.to_datetime(out[col], errors="raise")
-                # only accept if enough variation and not all NaT
-                if parsed.notna().mean() > 0.85:
-                    out[col] = parsed
-            except Exception:
-                pass
-    return out
+def make_demo_sales_dataset() -> pd.DataFrame:
+    np.random.seed(42)
+    dates = pd.date_range("2009-12-01", "2010-12-09", freq="h")
+    sample_size = 500
+
+    chosen_dates = np.random.choice(dates, sample_size)
+    product_types = np.random.choice(["cosmetics", "haircare", "skincare", "toys", "fashion"], sample_size, p=[0.28, 0.18, 0.20, 0.14, 0.20])
+    countries = np.random.choice(["United Kingdom", "France", "Germany", "Ireland", "India", "Spain"], sample_size)
+    genders = np.random.choice(["Male", "Female", "Non-binary", "Unknown"], sample_size)
+    devices = np.random.choice(["Mobile", "Desktop", "Tablet"], sample_size)
+    suppliers = np.random.choice(["Supplier 1", "Supplier 2", "Supplier 3", "Supplier 4"], sample_size)
+    carriers = np.random.choice(["DHL", "UPS", "FedEx", "Royal Mail"], sample_size)
+    stock_levels = np.random.randint(1, 100, sample_size)
+    lead_times = np.random.randint(1, 30, sample_size)
+    availability = np.random.randint(1, 100, sample_size)
+    price = np.round(np.random.uniform(2, 100, sample_size), 4)
+    num_sold = np.random.randint(20, 1000, sample_size)
+    shipping_times = np.random.randint(1, 24, sample_size)
+    shipping_costs = np.round(np.random.uniform(1, 25, sample_size), 4)
+    order_quantities = np.random.randint(1, 120, sample_size)
+    revenue_generated = np.round(price * num_sold * np.random.uniform(0.3, 0.9, sample_size), 4)
+    manufacturing_costs = np.round(price * np.random.uniform(0.1, 0.5, sample_size), 4)
+    production_volumes = np.random.randint(100, 5000, sample_size)
+    defect_rates = np.round(np.random.uniform(0.0, 0.15, sample_size), 4)
+    costs = np.round(manufacturing_costs * order_quantities + shipping_costs * 4, 4)
+
+    df = pd.DataFrame({
+        "Order datetime": chosen_dates,
+        "Product type": product_types,
+        "SKU": [f"SKU{i}" for i in range(sample_size)],
+        "Price": price,
+        "Availability": availability,
+        "Number of products sold": num_sold,
+        "Revenue generated": revenue_generated,
+        "Customer demographics": genders,
+        "Stock levels": stock_levels,
+        "Lead times": lead_times,
+        "Order quantities": order_quantities,
+        "Shipping times": shipping_times,
+        "Shipping carriers": carriers,
+        "Shipping costs": shipping_costs,
+        "Supplier name": suppliers,
+        "Location": countries,
+        "Production volumes": production_volumes,
+        "Manufacturing lead time": np.random.randint(1, 40, sample_size),
+        "Manufacturing costs": manufacturing_costs,
+        "Inspection results": np.random.choice(["Pass", "Review", "Fail"], sample_size, p=[0.72, 0.20, 0.08]),
+        "Defect rates": defect_rates,
+        "Transportation modes": np.random.choice(["Road", "Air", "Sea"], sample_size),
+        "Routes": np.random.choice(["A", "B", "C", "D"], sample_size),
+        "Costs": costs,
+    })
+    return df
 
 
-def get_numeric_columns(df: pd.DataFrame) -> List[str]:
-    return list(df.select_dtypes(include=[np.number]).columns)
+def infer_date_column(df: pd.DataFrame, roles: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    datetime_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    if datetime_cols:
+        return datetime_cols[0]
+    for col, role in roles.items():
+        if role["is_time"]:
+            maybe = try_parse_datetime(df[col])
+            if pd.api.types.is_datetime64_any_dtype(maybe):
+                df[col] = maybe
+                return col
+    return None
 
 
-def get_datetime_columns(df: pd.DataFrame) -> List[str]:
-    return list(df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns)
+def build_filters(df: pd.DataFrame, roles: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    filtered_df = df.copy()
+
+    st.sidebar.markdown("## Filters")
+
+    date_col = infer_date_column(filtered_df, roles)
+    if date_col and filtered_df[date_col].notna().sum() > 0:
+        min_date = filtered_df[date_col].min().date()
+        max_date = filtered_df[date_col].max().date()
+        st.sidebar.markdown("### Date range")
+        date_range = st.sidebar.date_input(
+            "Date range",
+            value=(min_date, max_date),
+            label_visibility="collapsed"
+        )
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_date, end_date = date_range
+            filtered_df = filtered_df[
+                (filtered_df[date_col].dt.date >= start_date) &
+                (filtered_df[date_col].dt.date <= end_date)
+            ]
+
+    candidate_filters = []
+    for col in filtered_df.columns:
+        if filtered_df[col].dtype == "object":
+            nunique = filtered_df[col].nunique(dropna=True)
+            if 1 < nunique <= 25:
+                candidate_filters.append(col)
+
+    for col in candidate_filters:
+        st.sidebar.markdown(f"### Filter {safe_label(col)}")
+        options = sorted([x for x in filtered_df[col].dropna().unique().tolist()])
+        selected = st.sidebar.multiselect(
+            label=safe_label(col),
+            options=options,
+            default=[],
+            label_visibility="collapsed"
+        )
+        if selected:
+            filtered_df = filtered_df[filtered_df[col].isin(selected)]
+
+    return filtered_df
 
 
-def get_categorical_columns(df: pd.DataFrame) -> List[str]:
-    cats = []
-    for col in df.columns:
-        if col in get_datetime_columns(df):
+def compute_data_quality_score(df: pd.DataFrame) -> int:
+    if len(df) == 0:
+        return 0
+    missing_ratio = df.isna().mean().mean()
+    duplicate_ratio = df.duplicated().mean()
+    score = 100 - int((missing_ratio * 60 + duplicate_ratio * 40) * 100)
+    return max(0, min(100, score))
+
+
+def detect_outlier_risk(df: pd.DataFrame, numeric_cols: List[str]) -> List[Dict[str, Any]]:
+    risks = []
+    for col in numeric_cols:
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(series) < 8:
             continue
-        if df[col].dtype == "object" or str(df[col].dtype).startswith("category"):
-            cats.append(col)
-    return cats
+        if series.nunique() < 5:
+            continue
+        q1 = series.quantile(0.25)
+        q3 = series.quantile(0.75)
+        iqr = q3 - q1
+        if iqr == 0:
+            continue
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        outlier_mask = (series < lower) | (series > upper)
+        outlier_ratio = float(outlier_mask.mean())
+        if outlier_ratio > 0.05:
+            risks.append({
+                "column": col,
+                "outlier_ratio": outlier_ratio
+            })
+    risks.sort(key=lambda x: x["outlier_ratio"], reverse=True)
+    return risks
 
 
-def choose_primary_metric(df: pd.DataFrame) -> Optional[str]:
-    numeric_cols = get_numeric_columns(df)
-    if not numeric_cols:
+def strongest_correlation(df: pd.DataFrame, metric_col: str, numeric_cols: List[str]) -> Optional[Tuple[str, float]]:
+    if metric_col not in numeric_cols:
         return None
-
-    preferred_names = [
-        "Revenue generated", "revenue", "sales", "sales_amount_gbp",
-        "amount", "profit", "income", "cost"
-    ]
-    for p in preferred_names:
-        for col in numeric_cols:
-            if p.lower() == col.lower():
-                return col
-        for col in numeric_cols:
-            if p.lower() in col.lower():
-                return col
-
-    return numeric_cols[0]
-
-
-def choose_primary_category(df: pd.DataFrame) -> Optional[str]:
-    categorical_cols = get_categorical_columns(df)
-    if not categorical_cols:
+    corr_df = df[numeric_cols].corr(numeric_only=True)
+    if metric_col not in corr_df.columns:
         return None
-
-    preferred_names = [
-        "Product type", "category", "Country", "region",
-        "Supplier name", "segment", "channel"
-    ]
-    for p in preferred_names:
-        for col in categorical_cols:
-            if p.lower() == col.lower():
-                return col
-        for col in categorical_cols:
-            if p.lower() in col.lower():
-                return col
-
-    return categorical_cols[0]
-
-
-def choose_time_col(df: pd.DataFrame) -> Optional[str]:
-    dt_cols = get_datetime_columns(df)
-    if not dt_cols:
+    corr_series = corr_df[metric_col].drop(labels=[metric_col], errors="ignore").dropna()
+    if corr_series.empty:
         return None
-
-    preferred = ["date", "datetime", "timestamp", "order_datetime", "time"]
-    for p in preferred:
-        for col in dt_cols:
-            if p.lower() == col.lower():
-                return col
-        for col in dt_cols:
-            if p.lower() in col.lower():
-                return col
-    return dt_cols[0]
+    strongest = corr_series.abs().sort_values(ascending=False).index[0]
+    return strongest, float(corr_series[strongest])
 
 
-def infer_best_segment(df: pd.DataFrame, metric: str, category_col: Optional[str]) -> str:
-    if category_col is None or metric is None or category_col not in df.columns or metric not in df.columns:
-        return "N/A"
+def get_evidence_rows(df: pd.DataFrame, segment_col: Optional[str], segment_value: Optional[str], metric_col: Optional[str], top_n: int = 5) -> pd.DataFrame:
+    temp = df.copy()
+    if segment_col and segment_value is not None and segment_col in temp.columns:
+        temp = temp[temp[segment_col].astype(str) == str(segment_value)]
 
-    grp = df.groupby(category_col, dropna=False)[metric].sum().sort_values(ascending=False)
-    if len(grp) == 0:
-        return "N/A"
-    return str(grp.index[0])
+    if metric_col and metric_col in temp.columns:
+        temp = temp.sort_values(metric_col, ascending=False)
+
+    return temp.head(top_n)
 
 
-def format_number(x) -> str:
-    if pd.isna(x):
-        return "N/A"
+def safe_json_load(text: str) -> Optional[dict]:
     try:
-        x = float(x)
-        if abs(x) >= 1_000_000:
-            return f"{x:,.2f}"
-        if abs(x) >= 1_000:
-            return f"{x:,.2f}"
-        return f"{x:,.2f}"
+        return json.loads(text)
     except Exception:
-        return str(x)
-
-
-def to_csv_download(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-
-# -----------------------------
-# GEMINI
-# -----------------------------
-def get_gemini_model():
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    if not api_key or genai is None:
         return None
 
+
+# =========================
+# GEMINI
+# =========================
+def get_gemini_api_key() -> Optional[str]:
+    key = os.getenv("GEMINI_API_KEY")
+    if key:
+        return key
+    return None
+
+
+def get_gemini_model():
+    api_key = get_gemini_api_key()
+    if not api_key or not GEMINI_AVAILABLE:
+        return None
     try:
         genai.configure(api_key=api_key)
         return genai.GenerativeModel("gemini-1.5-flash")
@@ -269,848 +545,703 @@ def call_gemini_json(prompt: str) -> Optional[dict]:
 
     try:
         response = model.generate_content(prompt)
-        text = response.text.strip()
-
-        if text.startswith("```json"):
-            text = text.replace("```json", "", 1).strip()
-        if text.startswith("```"):
-            text = text.replace("```", "").strip()
-        if text.endswith("```"):
-            text = text[:-3].strip()
-
-        return json.loads(text)
+        text = response.text.strip() if hasattr(response, "text") else ""
+        text = text.replace("```json", "").replace("```", "").strip()
+        parsed = safe_json_load(text)
+        return parsed
     except Exception:
         return None
 
 
-# -----------------------------
-# FILTERING
-# -----------------------------
-def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-    filtered_df = df.copy()
-
-    st.sidebar.markdown("## Filters")
-
-    # Date filter
-    time_col = choose_time_col(filtered_df)
-    if time_col and time_col in filtered_df.columns and len(filtered_df) > 0:
-        temp = filtered_df[time_col].dropna()
-        if len(temp) > 0:
-            min_date = temp.min().date()
-            max_date = temp.max().date()
-
-            date_range = st.sidebar.text_input(
-                "Date range",
-                f"{min_date.strftime('%Y/%m/%d')} – {max_date.strftime('%Y/%m/%d')}"
-            )
-
-            try:
-                parts = date_range.split("–")
-                start = pd.to_datetime(parts[0].strip()).date()
-                end = pd.to_datetime(parts[1].strip()).date()
-                filtered_df = filtered_df[
-                    (filtered_df[time_col].dt.date >= start) &
-                    (filtered_df[time_col].dt.date <= end)
-                ]
-            except Exception:
-                pass
-
-    # categorical filters
-    categorical_cols = get_categorical_columns(filtered_df)
-
-    for col in categorical_cols[:8]:
-        vals = filtered_df[col].dropna().astype(str).unique().tolist()
-        if len(vals) == 0:
-            continue
-
-        selected = st.sidebar.multiselect(
-            f"Filter {col}",
-            options=sorted(vals),
-            default=[]
-        )
-        if selected:
-            filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected)]
-
-    return filtered_df
-
-
-# -----------------------------
-# RISK / INSIGHT HELPERS
-# -----------------------------
-def detect_outlier_risk(df: pd.DataFrame, numeric_cols: List[str]) -> List[dict]:
-    risks = []
-
-    for col in numeric_cols:
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if len(series) < 5:
-            continue
-
-        q1 = series.quantile(0.25)
-        q3 = series.quantile(0.75)
-        iqr = q3 - q1
-
-        if iqr == 0 or pd.isna(iqr):
-            continue
-
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-
-        mask = (series < lower) | (series > upper)
-        share = mask.mean()
-
-        if share >= 0.07:
-            risks.append({
-                "column": col,
-                "share": share,
-                "message": f"Outlier concentration in {col} is elevated at {share * 100:.1f}%."
-            })
-
-    return sorted(risks, key=lambda x: x["share"], reverse=True)
-
-
-def strongest_and_weakest_segment(df: pd.DataFrame, metric: str, category_col: str) -> Tuple[Optional[tuple], Optional[tuple]]:
-    if metric not in df.columns or category_col not in df.columns:
-        return None, None
-
-    grp = df.groupby(category_col, dropna=False)[metric].sum().sort_values(ascending=False)
-    if len(grp) == 0:
-        return None, None
-
-    strongest = (grp.index[0], grp.iloc[0])
-    weakest = (grp.index[-1], grp.iloc[-1])
-    return strongest, weakest
-
-
-def trend_summary(df: pd.DataFrame, time_col: Optional[str], metric: Optional[str]) -> Optional[dict]:
-    if not time_col or not metric:
-        return None
-    if time_col not in df.columns or metric not in df.columns:
-        return None
-
-    temp = df[[time_col, metric]].dropna().copy()
-    if len(temp) < 2:
-        return None
-
-    temp["period"] = temp[time_col].dt.to_period("M").astype(str)
-    trend = temp.groupby("period")[metric].sum().reset_index()
-
-    if len(trend) < 2:
-        return None
-
-    first_val = trend[metric].iloc[0]
-    last_val = trend[metric].iloc[-1]
-
-    if first_val == 0:
-        pct_change = np.nan
-    else:
-        pct_change = ((last_val - first_val) / first_val) * 100
-
-    direction = "improved" if last_val >= first_val else "declined"
-
-    return {
-        "trend_df": trend,
-        "first_val": first_val,
-        "last_val": last_val,
-        "pct_change": pct_change,
-        "direction": direction,
-    }
-
-
-def strongest_correlation(df: pd.DataFrame, metric: str) -> Optional[dict]:
-    numeric_cols = get_numeric_columns(df)
-    if metric not in numeric_cols or len(numeric_cols) < 2:
-        return None
-
-    corr = df[numeric_cols].corr(numeric_only=True)
-    if metric not in corr.columns:
-        return None
-
-    s = corr[metric].drop(index=metric).dropna()
-    if len(s) == 0:
-        return None
-
-    strongest = s.abs().sort_values(ascending=False).index[0]
-    value = s[strongest]
-    return {
-        "column": strongest,
-        "value": value
-    }
-
-
-def get_top_rows_for_filter(df: pd.DataFrame, filter_col: str, filter_val, metric: str, top_n: int = 5) -> pd.DataFrame:
-    temp = df[df[filter_col].astype(str) == str(filter_val)].copy()
-    if metric in temp.columns:
-        temp = temp.sort_values(metric, ascending=False)
-    return temp.head(top_n)
-
-
-# -----------------------------
+# =========================
 # ENGINES
-# -----------------------------
-def rule_based_engine(df: pd.DataFrame, metric: str, category_col: str, time_col: Optional[str], outlier_risks: List[dict]) -> List[dict]:
+# =========================
+def rule_based_engine(df: pd.DataFrame, metric_col: str, segment_summary: Optional[Dict[str, Any]], outlier_risks: List[Dict[str, Any]], date_col: Optional[str]) -> List[Dict[str, Any]]:
     insights = []
 
-    strongest, weakest = strongest_and_weakest_segment(df, metric, category_col)
-    trend = trend_summary(df, time_col, metric)
-
-    if strongest:
+    if segment_summary:
         insights.append({
             "engine": "Rule-Based Engine",
             "insight_type": "Trend",
-            "insight": f"The strongest driver of {metric} is {strongest[0]} within {category_col}, contributing {format_number(strongest[1])} overall.",
-            "relevance": 85,
-            "actionability": 35,
-            "consistency": 4.0,
-            "clarity": 80,
+            "insight": (
+                f"The strongest driver of {metric_col} is {segment_summary['strongest_name']} "
+                f"within {segment_summary['segment_col']}, contributing {segment_summary['strongest_value']:,.2f} overall."
+            ),
+            "evidence": f"Grounded from filtered dataset: {segment_summary['segment_col']}={segment_summary['strongest_name']}, total_{metric_col}={segment_summary['strongest_value']:.2f}.",
             "base_confidence": 88,
-            "evidence_col": category_col,
-            "evidence_val": strongest[0],
+            "segment_col": segment_summary["segment_col"],
+            "segment_value": segment_summary["strongest_name"]
         })
 
-    if weakest:
         insights.append({
             "engine": "Rule-Based Engine",
             "insight_type": "Recommendation",
-            "insight": f"Underperformance appears in {weakest[0]} under {category_col}, making it a priority area for review.",
-            "relevance": 55,
-            "actionability": 80,
-            "consistency": 4.0,
-            "clarity": 80,
+            "insight": (
+                f"Underperformance appears in {segment_summary['weakest_name']} under {segment_summary['segment_col']}, "
+                f"making it a priority area for review."
+            ),
+            "evidence": f"Grounded from filtered dataset: weakest {segment_summary['segment_col']}={segment_summary['weakest_name']}, value={segment_summary['weakest_value']:.2f}.",
             "base_confidence": 84,
-            "evidence_col": category_col,
-            "evidence_val": weakest[0],
+            "segment_col": segment_summary["segment_col"],
+            "segment_value": segment_summary["weakest_name"]
         })
 
-    if trend is not None and not pd.isna(trend["pct_change"]):
-        insights.append({
-            "engine": "Rule-Based Engine",
-            "insight_type": "Trend",
-            "insight": f"Over time, {metric} has {trend['direction']} by {abs(trend['pct_change']):.1f}% from the first month to the latest month.",
-            "relevance": 75,
-            "actionability": 55,
-            "consistency": 4.0,
-            "clarity": 85,
-            "base_confidence": 90,
-            "evidence_col": None,
-            "evidence_val": None,
-        })
+    if date_col and metric_col in df.columns:
+        try:
+            temp = df[[date_col, metric_col]].dropna().copy()
+            if len(temp) > 3:
+                temp = temp.sort_values(date_col)
+                start_val = temp.iloc[0][metric_col]
+                end_val = temp.iloc[-1][metric_col]
+                if pd.notna(start_val) and pd.notna(end_val) and abs(start_val) > 1e-9:
+                    pct_change = ((end_val - start_val) / abs(start_val)) * 100
+                    direction = "improved" if pct_change >= 0 else "declined"
+                    insights.append({
+                        "engine": "Rule-Based Engine",
+                        "insight_type": "Trend",
+                        "insight": (
+                            f"Over time, {metric_col} has {direction} by {abs(pct_change):.1f}% from the first observed period to the latest period."
+                        ),
+                        "evidence": f"Grounded from time ordering of {date_col}: start={start_val:.2f}, end={end_val:.2f}.",
+                        "base_confidence": 90,
+                        "segment_col": None,
+                        "segment_value": None
+                    })
+        except Exception:
+            pass
 
     if outlier_risks:
-        r = outlier_risks[0]
+        top = outlier_risks[0]
         insights.append({
             "engine": "Rule-Based Engine",
             "insight_type": "Risk",
-            "insight": r["message"],
-            "relevance": 55,
-            "actionability": 65,
-            "consistency": 4.0,
-            "clarity": 80,
+            "insight": (
+                f"Outlier concentration in {top['column']} is elevated at {top['outlier_ratio'] * 100:.1f}%, "
+                f"which may distort averages and trends."
+            ),
+            "evidence": f"Grounded from IQR-based outlier detection on {top['column']}.",
             "base_confidence": 80,
-            "evidence_col": None,
-            "evidence_val": None,
+            "segment_col": None,
+            "segment_value": None
         })
 
     return insights
 
 
-def statistical_engine(df: pd.DataFrame, metric: str, category_col: str, outlier_risks: List[dict]) -> List[dict]:
+def statistical_engine(df: pd.DataFrame, metric_col: str, numeric_cols: List[str], outlier_risks: List[Dict[str, Any]], date_col: Optional[str]) -> List[Dict[str, Any]]:
     insights = []
 
-    corr = strongest_correlation(df, metric)
-    if corr:
-        direction = "positive" if corr["value"] >= 0 else "negative"
+    strongest = strongest_correlation(df, metric_col, numeric_cols)
+    if strongest:
+        other_col, corr_val = strongest
+        direction = "positive" if corr_val >= 0 else "negative"
         insights.append({
             "engine": "Statistical Engine",
             "insight_type": "Trend",
-            "insight": f"The strongest statistical relationship is a {direction} correlation of {corr['value']:.2f} between {corr['column']} and {metric}.",
-            "relevance": 85,
-            "actionability": 35,
-            "consistency": 4.0,
-            "clarity": 80,
+            "insight": (
+                f"The strongest statistical relationship is a {direction} correlation of {corr_val:.2f} between {other_col} and {metric_col}."
+            ),
+            "evidence": f"Grounded from Pearson correlation matrix on numeric fields.",
             "base_confidence": 82,
-            "evidence_col": None,
-            "evidence_val": None,
+            "segment_col": None,
+            "segment_value": None
         })
 
     if outlier_risks:
-        r = outlier_risks[0]
+        top = outlier_risks[0]
         insights.append({
             "engine": "Statistical Engine",
             "insight_type": "Risk",
-            "insight": r["message"],
-            "relevance": 75,
-            "actionability": 55,
-            "consistency": 4.0,
-            "clarity": 80,
+            "insight": (
+                f"Outlier analysis shows that {top['column']} has the highest anomaly concentration at {top['outlier_ratio'] * 100:.1f}%."
+            ),
+            "evidence": f"Grounded from IQR thresholds over numeric distribution.",
             "base_confidence": 78,
-            "evidence_col": None,
-            "evidence_val": None,
+            "segment_col": None,
+            "segment_value": None
         })
+
+    if date_col and metric_col in df.columns:
+        try:
+            temp = df[[date_col, metric_col]].dropna().copy()
+            if len(temp) > 5:
+                temp["period"] = temp[date_col].dt.to_period("M").astype(str)
+                monthly = temp.groupby("period")[metric_col].mean()
+                if len(monthly) >= 3:
+                    recent = monthly.tail(3)
+                    slope = np.polyfit(range(len(recent)), recent.values, 1)[0]
+                    direction = "upward" if slope > 0 else "downward"
+                    insights.append({
+                        "engine": "Statistical Engine",
+                        "insight_type": "Trend",
+                        "insight": (
+                            f"Recent monthly movement for {metric_col} shows a {direction} direction across the latest observed periods."
+                        ),
+                        "evidence": f"Grounded from monthly average aggregation on {date_col}.",
+                        "base_confidence": 76,
+                        "segment_col": None,
+                        "segment_value": None
+                    })
+        except Exception:
+            pass
 
     return insights
 
 
-def narrative_engine(df: pd.DataFrame, metric: str, category_col: str) -> List[dict]:
+def narrative_engine(df: pd.DataFrame, metric_col: str, segment_summary: Optional[Dict[str, Any]], quality_score: int) -> List[Dict[str, Any]]:
     insights = []
-    strongest, weakest = strongest_and_weakest_segment(df, metric, category_col)
 
-    if strongest:
+    if segment_summary:
         insights.append({
             "engine": "Narrative Engine",
             "insight_type": "Recommendation",
-            "insight": f"From a business perspective, {strongest[0]} in {category_col} appears to be a dependable growth segment that should be protected and scaled.",
-            "relevance": 75,
-            "actionability": 80,
-            "consistency": 4.0,
-            "clarity": 95,
-            "base_confidence": 75,
-            "evidence_col": category_col,
-            "evidence_val": strongest[0],
+            "insight": (
+                f"From a business perspective, {segment_summary['strongest_name']} in {segment_summary['segment_col']} "
+                f"appears to be a dependable growth segment that should be protected and scaled."
+            ),
+            "evidence": f"Grounded from filtered dataset totals in {segment_summary['segment_col']}.",
+            "base_confidence": 85,
+            "segment_col": segment_summary["segment_col"],
+            "segment_value": segment_summary["strongest_name"]
         })
 
-    if weakest:
         insights.append({
             "engine": "Narrative Engine",
             "insight_type": "Risk",
-            "insight": f"The weakest segment appears to be {weakest[0]} in {category_col}, suggesting a need for targeted investigation and intervention.",
-            "relevance": 55,
-            "actionability": 55,
-            "consistency": 4.0,
-            "clarity": 95,
-            "base_confidence": 75,
-            "evidence_col": category_col,
-            "evidence_val": weakest[0],
+            "insight": (
+                f"The weakest segment appears to be {segment_summary['weakest_name']} in {segment_summary['segment_col']}, "
+                f"suggesting a need for targeted investigation and intervention."
+            ),
+            "evidence": f"Grounded from lowest contribution segment in current filtered dataset.",
+            "base_confidence": 82,
+            "segment_col": segment_summary["segment_col"],
+            "segment_value": segment_summary["weakest_name"]
         })
 
     insights.append({
         "engine": "Narrative Engine",
         "insight_type": "General",
-        "insight": "Decision confidence is relatively strong because the filtered dataset is internally consistent and provides enough rows for directional business interpretation.",
-        "relevance": 45,
-        "actionability": 35,
-        "consistency": 4.0,
-        "clarity": 95,
-        "base_confidence": 70,
-        "evidence_col": None,
-        "evidence_val": None,
+        "insight": (
+            f"Decision confidence is relatively strong because the data quality score is {quality_score}/100, "
+            f"supporting more reliable interpretation."
+        ),
+        "evidence": f"Grounded from missing-value and duplicate-rate checks.",
+        "base_confidence": 75,
+        "segment_col": None,
+        "segment_value": None
     })
 
     return insights
 
 
-def gemini_engine(df: pd.DataFrame, metric: str, category_col: str) -> List[dict]:
-    model = get_gemini_model()
-
-    if model is None:
+def gemini_engine(filtered_df: pd.DataFrame, metric_col: str, category_col: Optional[str], snippet_rows: pd.DataFrame) -> List[Dict[str, Any]]:
+    api_key = get_gemini_api_key()
+    if not api_key or not GEMINI_AVAILABLE:
         return [{
             "engine": "Gemini LLM Engine",
             "insight_type": "General",
-            "insight": "Gemini was unavailable in this run, so final ranking should be interpreted without supplemental LLM reasoning.",
-            "relevance": 45,
-            "actionability": 35,
-            "consistency": 2.5,
-            "clarity": 85,
-            "base_confidence": 35,
-            "evidence_col": None,
-            "evidence_val": None,
+            "insight": "Gemini was unavailable in this run, so final ranking should be interpreted without LLM-supported reasoning.",
+            "evidence": "No valid Gemini API key or Gemini SDK unavailable.",
+            "base_confidence": 40,
+            "segment_col": None,
+            "segment_value": None
         }]
 
-    sample = df.head(10).to_dict(orient="records")
+    cols_preview = filtered_df.columns.tolist()[:20]
+    rows_preview = snippet_rows.head(5).to_dict(orient="records")
+
     prompt = f"""
-You are a careful data analyst.
-Dataset rows: {len(df)}
-Metric: {metric}
-Category: {category_col}
-
-Sample rows:
-{json.dumps(sample, default=str)}
-
-Return valid JSON only:
+You are a careful business data analyst.
+Return ONLY valid JSON with this schema:
 {{
   "insights": [
     {{
+      "insight_type": "General|Trend|Recommendation|Risk",
       "insight": "text",
-      "insight_type": "General",
-      "relevance": 0,
-      "actionability": 0,
-      "consistency": 0,
-      "clarity": 0,
-      "base_confidence": 0
+      "evidence": "text",
+      "base_confidence": 0-100
     }}
   ]
 }}
+
+Context:
+- Primary metric: {metric_col}
+- Category column: {category_col}
+- Columns preview: {cols_preview}
+- Example rows: {json.dumps(rows_preview, default=str)}
+
+Rules:
+- Do not hallucinate.
+- Base every claim only on the provided rows and context.
+- Max 3 insights.
+- Keep wording concise and business-friendly.
 """
 
     result = call_gemini_json(prompt)
-
     if not result or "insights" not in result:
         return [{
             "engine": "Gemini LLM Engine",
             "insight_type": "General",
-            "insight": "Gemini returned no structured output, so fallback handling was applied.",
-            "relevance": 45,
-            "actionability": 35,
-            "consistency": 2.5,
-            "clarity": 80,
-            "base_confidence": 30,
-            "evidence_col": None,
-            "evidence_val": None,
+            "insight": "Gemini response could not be parsed in this run, so final ranking should be interpreted without LLM-supported reasoning.",
+            "evidence": "Gemini returned invalid or empty structured output.",
+            "base_confidence": 35,
+            "segment_col": None,
+            "segment_value": None
         }]
 
-    outputs = []
+    insights = []
     for item in result.get("insights", [])[:3]:
-        outputs.append({
+        insights.append({
             "engine": "Gemini LLM Engine",
             "insight_type": item.get("insight_type", "General"),
             "insight": item.get("insight", "No insight returned."),
-            "relevance": item.get("relevance", 50),
-            "actionability": item.get("actionability", 50),
-            "consistency": item.get("consistency", 3.0),
-            "clarity": item.get("clarity", 80),
-            "base_confidence": item.get("base_confidence", 50),
-            "evidence_col": None,
-            "evidence_val": None,
+            "evidence": item.get("evidence", "Grounded from provided snippet rows."),
+            "base_confidence": int(item.get("base_confidence", 65)),
+            "segment_col": category_col,
+            "segment_value": None
         })
 
-    if not outputs:
-        outputs.append({
+    if not insights:
+        insights.append({
             "engine": "Gemini LLM Engine",
             "insight_type": "General",
-            "insight": "Gemini produced an empty response set.",
-            "relevance": 45,
-            "actionability": 35,
-            "consistency": 2.5,
-            "clarity": 80,
-            "base_confidence": 30,
-            "evidence_col": None,
-            "evidence_val": None,
+            "insight": "Gemini did not return usable insights for this run.",
+            "evidence": "No structured insights available.",
+            "base_confidence": 35,
+            "segment_col": None,
+            "segment_value": None
         })
 
-    return outputs
+    return insights
 
 
-# -----------------------------
-# EVIDENCE / BENCHMARK / FINAL SCORING
-# -----------------------------
-def attach_evidence(df: pd.DataFrame, insights: List[dict], metric: str) -> List[dict]:
-    enriched = []
+# =========================
+# SCORING
+# =========================
+def benchmark_score_insight(text: str, insight_type: str, evidence: str, base_confidence: int) -> Dict[str, Any]:
+    relevance = 85 if insight_type in ["Trend", "Recommendation"] else 75
+    actionability = 80 if insight_type == "Recommendation" else 55 if insight_type == "Risk" else 35
+    clarity = 95 if len(text) < 180 else 80
+    consistency = 4.0 if evidence and "Grounded" in evidence else 2.5
 
-    for ins in insights:
-        item = ins.copy()
-
-        if item.get("evidence_col") and item.get("evidence_val") is not None:
-            e_df = get_top_rows_for_filter(df, item["evidence_col"], item["evidence_val"], metric, top_n=5)
-        else:
-            e_df = df.head(5)
-
-        item["evidence_rows"] = e_df
-        item["evidence_text"] = build_evidence_text(df, item, metric)
-        item["adjusted_final_score"] = compute_final_score(item)
-        enriched.append(item)
-
-    return enriched
-
-
-def build_evidence_text(df: pd.DataFrame, insight: dict, metric: str) -> str:
-    e_col = insight.get("evidence_col")
-    e_val = insight.get("evidence_val")
-
-    if e_col and e_val is not None and e_col in df.columns:
-        sub = df[df[e_col].astype(str) == str(e_val)]
-        total = sub[metric].sum() if metric in sub.columns else np.nan
-        avg = sub[metric].mean() if metric in sub.columns else np.nan
-        return f"Grounded from filtered dataset: {e_col}={e_val}, rows={len(sub)}, total_{metric}={format_number(total)}, avg_{metric}={format_number(avg)}."
-
-    total = df[metric].sum() if metric in df.columns else np.nan
-    avg = df[metric].mean() if metric in df.columns else np.nan
-    return f"Grounded from filtered dataset: rows={len(df)}, sum_{metric}={format_number(total)}, mean_{metric}={format_number(avg)}."
-
-
-def compute_final_score(insight: dict) -> float:
-    relevance = float(insight.get("relevance", 50))
-    actionability = float(insight.get("actionability", 50))
-    clarity = float(insight.get("clarity", 70))
-    consistency = float(insight.get("consistency", 3.0)) * 20
-    confidence = float(insight.get("base_confidence", 50))
-
-    score = (
-        0.25 * relevance +
-        0.20 * actionability +
+    final_score = (
+        0.30 * relevance +
+        0.25 * actionability +
         0.20 * clarity +
-        0.15 * consistency +
-        0.20 * confidence
+        0.10 * (consistency * 20) +
+        0.15 * base_confidence
     )
-    return round(score, 1)
+
+    return {
+        "Relevance": relevance,
+        "Actionability": actionability,
+        "Consistency": round(consistency, 1),
+        "Clarity": clarity,
+        "Adjusted Final Score": round(final_score, 1)
+    }
 
 
-def build_benchmark_table(all_insights: List[dict]) -> pd.DataFrame:
+def make_benchmark_table(insights: List[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
-    for ins in all_insights:
+    for item in insights:
+        scores = benchmark_score_insight(
+            item["insight"],
+            item["insight_type"],
+            item["evidence"],
+            item["base_confidence"]
+        )
         rows.append({
-            "Engine": ins["engine"],
-            "Insight Type": ins["insight_type"],
-            "Insight": ins["insight"],
-            "Relevance": ins["relevance"],
-            "Actionability": ins["actionability"],
-            "Consistency": ins["consistency"],
-            "Clarity": ins["clarity"],
-            "Base Confidence": ins["base_confidence"],
-            "Adjusted Final Score": ins["adjusted_final_score"],
+            "Engine": item["engine"],
+            "Insight Type": item["insight_type"],
+            "Insight": item["insight"],
+            "Relevance": scores["Relevance"],
+            "Actionability": scores["Actionability"],
+            "Consistency": scores["Consistency"],
+            "Clarity": scores["Clarity"],
+            "Base Confidence": item["base_confidence"],
+            "Adjusted Final Score": scores["Adjusted Final Score"]
         })
+    if not rows:
+        return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("Adjusted Final Score", ascending=False)
 
 
-def get_final_reliable_insights(all_insights: List[dict], top_n: int = 5) -> List[dict]:
-    ordered = sorted(all_insights, key=lambda x: x["adjusted_final_score"], reverse=True)
-    final_list = []
-    seen_text = set()
-
-    for ins in ordered:
-        normalized = ins["insight"].strip().lower()
-        if normalized in seen_text:
-            continue
-        seen_text.add(normalized)
-        final_list.append(ins)
-        if len(final_list) >= top_n:
-            break
-
-    return final_list
-
-
-# -----------------------------
+# =========================
 # ASK YOUR DATA
-# -----------------------------
-def answer_grounded_question(df: pd.DataFrame, question: str, metric: Optional[str], category_col: Optional[str]) -> str:
-    q = question.strip().lower()
+# =========================
+def answer_grounded_question(question: str, df: pd.DataFrame, metric_col: Optional[str], segment_summary: Optional[Dict[str, Any]]) -> str:
+    q = question.lower().strip()
     if not q:
         return ""
 
-    if metric and "total" in q and metric.lower() in q:
-        return f"Total {metric}: {format_number(df[metric].sum())}"
-
-    if metric and "average" in q and metric.lower() in q:
-        return f"Average {metric}: {format_number(df[metric].mean())}"
-
-    if category_col and metric and ("best" in q or "top" in q):
-        grp = df.groupby(category_col)[metric].sum().sort_values(ascending=False)
-        if len(grp) > 0:
-            return f"Top {category_col} by {metric}: {grp.index[0]} with {format_number(grp.iloc[0])}"
-
-    if category_col and metric and ("worst" in q or "lowest" in q):
-        grp = df.groupby(category_col)[metric].sum().sort_values(ascending=True)
-        if len(grp) > 0:
-            return f"Weakest {category_col} by {metric}: {grp.index[0]} with {format_number(grp.iloc[0])}"
-
-    return "I could not map that question cleanly yet. Try asking about total, average, top segment, or weakest segment."
-
-
-# -----------------------------
-# VISUALS
-# -----------------------------
-def render_recommended_visuals(df: pd.DataFrame, metric: Optional[str], category_col: Optional[str], time_col: Optional[str]):
-    st.markdown("## Recommended Visualization")
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        if category_col and metric and category_col in df.columns and metric in df.columns:
-            grp = df.groupby(category_col)[metric].sum().sort_values(ascending=False).head(10).reset_index()
-            fig = px.bar(grp, x=category_col, y=metric, title=f"Top {category_col} by {metric}")
-            st.plotly_chart(fig, use_container_width=True)
-
-    with c2:
-        if metric and metric in df.columns:
-            fig = px.histogram(df, x=metric, title=f"Distribution of {metric}")
-            st.plotly_chart(fig, use_container_width=True)
-
-    if len(get_numeric_columns(df)) >= 2:
-        st.markdown("## Correlation Heatmap")
-        corr = df[get_numeric_columns(df)].corr(numeric_only=True)
-        heat = go.Figure(
-            data=go.Heatmap(
-                z=corr.values,
-                x=corr.columns,
-                y=corr.index,
-                colorscale="Blues",
-                zmin=-1,
-                zmax=1,
-                text=np.round(corr.values, 2),
-                texttemplate="%{text}",
+    if "best segment" in q or "strongest segment" in q:
+        if segment_summary:
+            return (
+                f"The strongest segment is **{segment_summary['strongest_name']}** under **{segment_summary['segment_col']}**, "
+                f"with approximately **{segment_summary['strongest_value']:,.2f}** in {metric_col}."
             )
-        )
-        heat.update_layout(height=650)
-        st.plotly_chart(heat, use_container_width=True)
+        return "I couldn't identify a strong segment from the current filtered dataset."
 
-    if time_col and metric and time_col in df.columns and metric in df.columns:
-        st.markdown("## Time Trend")
-        temp = df[[time_col, metric]].dropna().copy()
-        if len(temp) > 1:
-            monthly = temp.resample("M", on=time_col)[metric].sum().reset_index()
-            fig = px.line(monthly, x=time_col, y=metric, title=f"{metric} over time")
-            st.plotly_chart(fig, use_container_width=True)
+    if "weakest segment" in q or "worst segment" in q:
+        if segment_summary:
+            return (
+                f"The weakest segment is **{segment_summary['weakest_name']}** under **{segment_summary['segment_col']}**, "
+                f"with approximately **{segment_summary['weakest_value']:,.2f}** in {metric_col}."
+            )
+        return "I couldn't identify a weak segment from the current filtered dataset."
 
+    if metric_col and ("total" in q or "sum" in q):
+        total = df[metric_col].sum()
+        return f"The total **{metric_col}** in the current filtered dataset is **{total:,.2f}**."
 
-# -----------------------------
-# MAIN APP
-# -----------------------------
-def main():
-    st.title("Client Intelligence Platform")
-    st.write(
-        "Upload a CSV/XLSX file or use demo mode to generate KPI dashboards, trend analysis, "
-        "anomaly detection, recommendations, multi-engine insight evaluation, retrieval-backed evidence, and agent-style Q&A."
+    if metric_col and ("average" in q or "mean" in q):
+        avg = df[metric_col].mean()
+        return f"The average **{metric_col}** in the current filtered dataset is **{avg:,.2f}**."
+
+    return (
+        "Try asking something like:\n"
+        "- What is the best segment?\n"
+        "- What is the weakest segment?\n"
+        "- What is the total revenue?\n"
+        "- What is the average revenue?"
     )
 
-    # Sidebar input
+
+# =========================
+# VISUALS
+# =========================
+def render_recommended_visualization(df: pd.DataFrame, metric_col: Optional[str], date_col: Optional[str], segment_col: Optional[str]):
+    st.markdown("## Recommended Visualization")
+
+    if metric_col is None:
+        st.info("No numeric metric available for visualization.")
+        return
+
+    if date_col and pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        st.markdown(f"Recommended chart: line chart because **{date_col}** is a time field and **{metric_col}** is numeric.")
+        temp = df[[date_col, metric_col]].dropna().sort_values(date_col)
+        fig = px.line(temp, x=date_col, y=metric_col, title=f"{metric_col} over time")
+        st.plotly_chart(fig, use_container_width=True)
+    elif segment_col:
+        grouped = df.groupby(segment_col)[metric_col].sum().sort_values(ascending=False).head(10).reset_index()
+        st.markdown(f"Recommended chart: bar chart because **{segment_col}** is categorical and **{metric_col}** is numeric.")
+        fig = px.bar(grouped, x=segment_col, y=metric_col, title=f"Top {safe_label(segment_col)} by {metric_col}")
+        st.plotly_chart(fig, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if segment_col:
+            grouped = df.groupby(segment_col)[metric_col].sum().sort_values(ascending=False).head(10).reset_index()
+            fig = px.bar(grouped, x=segment_col, y=metric_col, title=f"Top {safe_label(segment_col)} by {metric_col}")
+            st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.histogram(df, x=metric_col, title=f"Distribution of {metric_col}")
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_correlation_heatmap(df: pd.DataFrame, numeric_cols: List[str]):
+    st.markdown("## Correlation Heatmap")
+    if len(numeric_cols) < 2:
+        st.info("Not enough numeric columns for a correlation heatmap.")
+        return
+    corr = df[numeric_cols].corr(numeric_only=True)
+    fig = px.imshow(corr, text_auto=".2f", aspect="auto", title="Numeric Correlation Matrix")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# =========================
+# DOWNLOADS
+# =========================
+def to_csv_download(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
+# =========================
+# MAIN APP
+# =========================
+def main():
+    st.title("Client Intelligence Platform")
+    st.markdown(
+        "Upload a CSV/XLSX file or try demo mode to generate KPI dashboards, trend analysis, anomaly detection, recommendations, "
+        "multi-engine insight evaluation, retrieval-backed evidence, and agent-style Q&A."
+    )
+
+    st.markdown("")
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown('<div class="info-box"><b>Business Problem</b> Teams often receive raw data with little clarity on what matters most.</div>', unsafe_allow_html=True)
+    with col2:
+        st.markdown('<div class="info-box"><b>What this platform does</b> Converts raw data into summaries, KPIs, charts, risks, and actions.</div>', unsafe_allow_html=True)
+    with col3:
+        st.markdown('<div class="info-box"><b>Perplexity-style upgrade</b> Retrieval-backed evidence, source snippets, benchmark scoring, and agent Q&A.</div>', unsafe_allow_html=True)
+    with col4:
+        st.markdown('<div class="info-box"><b>How to use it</b> Upload data, filter it, review insights, inspect evidence, and ask grounded questions.</div>', unsafe_allow_html=True)
+
     st.sidebar.markdown("## Data Input")
     input_mode = st.sidebar.radio(
         "Choose input mode",
-        ["Upload your own file", "Use demo sales dataset"]
+        options=["Upload your own file", "Use demo sales dataset"]
     )
 
-    df = pd.DataFrame()
+    df = None
+    uploaded_file = None
 
-    if input_mode == "Use demo sales dataset":
+    if input_mode == "Upload your own file":
+        uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
+        if uploaded_file is not None:
+            try:
+                df = read_uploaded_file(uploaded_file)
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+                st.stop()
+    else:
         df = make_demo_sales_dataset()
         demo_csv = to_csv_download(df)
         st.sidebar.download_button(
             "Download sample sales dataset",
             data=demo_csv,
-            file_name="sample_sales_dataset.csv",
-            mime="text/csv",
+            file_name="demo_sales_dataset.csv",
+            mime="text/csv"
         )
-    else:
-        uploaded = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
-        if uploaded is not None:
-            df = safe_read_file(uploaded)
 
-    if df.empty:
-        st.info("Upload a CSV/XLSX file or switch to demo mode.")
+    if df is None:
+        st.info("Upload a file or choose demo mode to begin.")
         st.stop()
 
-    df = detect_datetime_columns(df)
+    df = clean_dataframe(df)
 
-    filtered_df = apply_filters(df)
+    roles = detect_column_roles(df)
+    dataset_type = detect_dataset_type(df)
+    filtered_df = build_filters(df, roles)
 
     if filtered_df.empty:
-        st.warning("No rows left after filtering.")
+        st.warning("No rows remain after applying filters.")
         st.stop()
 
-    metric = choose_primary_metric(filtered_df)
-    category_col = choose_primary_category(filtered_df)
-    time_col = choose_time_col(filtered_df)
-    numeric_cols = get_numeric_columns(filtered_df)
+    filtered_roles = detect_column_roles(filtered_df)
+    safe_segment_cols = get_safe_segment_columns(filtered_df, filtered_roles)
+    safe_metric_cols = get_safe_metric_columns(filtered_df, filtered_roles)
+    primary_metric = choose_primary_metric(filtered_df, safe_metric_cols)
+    date_col = infer_date_column(filtered_df, filtered_roles)
 
-    # Header cards
-    best_segment = infer_best_segment(filtered_df, metric, category_col)
+    best_segment_col = choose_best_segment_column(filtered_df, safe_segment_cols, primary_metric) if primary_metric else None
+    segment_summary = summarize_strongest_and_weakest_segment(filtered_df, best_segment_col, primary_metric) if best_segment_col and primary_metric else None
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
+    quality_score = compute_data_quality_score(filtered_df)
+    duplicates = int(filtered_df.duplicated().sum())
+    missing_values = int(filtered_df.isna().sum().sum())
+
+    best_segment_display = "N/A"
+    if segment_summary:
+        best_segment_display = f"{segment_summary['strongest_name']} ({segment_summary['segment_col']})"
+
+    # KPIs
+    st.markdown("---")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
         st.metric("Rows", f"{len(filtered_df):,}")
-    with c2:
+    with k2:
         st.metric("Columns", f"{filtered_df.shape[1]:,}")
-    with c3:
-        st.metric("Missing Values", int(filtered_df.isna().sum().sum()))
-    with c4:
-        st.metric("Duplicates", int(filtered_df.duplicated().sum()))
-    with c5:
-        quality_score = max(0, 100 - min(25, int(filtered_df.duplicated().sum())) - min(25, int(filtered_df.isna().sum().sum())))
+    with k3:
+        st.metric("Missing Values", f"{missing_values:,}")
+    with k4:
+        st.metric("Duplicates", f"{duplicates:,}")
+    with k5:
         st.metric("Data Quality Score", f"{quality_score}/100")
 
-    c6, c7, c8 = st.columns(3)
-    with c6:
-        st.metric(f"Total {metric}" if metric else "Total", format_number(filtered_df[metric].sum()) if metric else "N/A")
-    with c7:
-        st.metric(f"Average {metric}" if metric else "Average", format_number(filtered_df[metric].mean()) if metric else "N/A")
-    with c8:
-        st.metric("Best Segment", best_segment)
+    if primary_metric:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric(f"Total {primary_metric}", readable_value(filtered_df[primary_metric].sum()))
+        with c2:
+            st.metric(f"Average {primary_metric}", readable_value(filtered_df[primary_metric].mean()))
+        with c3:
+            st.metric("Best Segment", best_segment_display)
 
-    st.divider()
-
-    # Summary + risks
-    strongest, weakest = strongest_and_weakest_segment(filtered_df, metric, category_col) if metric and category_col else (None, None)
-    trend = trend_summary(filtered_df, time_col, metric) if metric else None
-    outlier_risks = detect_outlier_risk(filtered_df, numeric_cols)
-
+    # Executive Summary + Risk Alerts
+    st.markdown("---")
     left, right = st.columns([2, 1])
 
     with left:
         st.markdown("## Executive Summary")
-        summary_parts = [
-            f"The dataset contains {len(filtered_df):,} records across {filtered_df.shape[1]} columns."
-        ]
-        if metric:
-            summary_parts.append(f"The primary business metric appears to be **{metric}**, with a total value of **{format_number(filtered_df[metric].sum())}**.")
-        if strongest and category_col:
-            summary_parts.append(f"The strongest contribution comes from **{strongest[0]}** in **{category_col}**, contributing **{format_number(strongest[1])}**.")
-        if weakest and category_col:
-            summary_parts.append(f"The weakest contribution appears in **{weakest[0]}** under **{category_col}**.")
-        if trend is not None and not pd.isna(trend['pct_change']):
-            summary_parts.append(f"Over time, **{metric}** has **{trend['direction']} by {abs(trend['pct_change']):.1f}%** from the first observed month to the latest month.")
+        executive_lines = []
+        executive_lines.append(f"The dataset contains {len(filtered_df):,} records across {filtered_df.shape[1]} columns.")
+        executive_lines.append(f"The detected dataset type is **{dataset_type}**.")
 
-        st.markdown('<div class="main-card">' + " ".join(summary_parts) + "</div>", unsafe_allow_html=True)
+        if primary_metric:
+            total_metric = filtered_df[primary_metric].sum()
+            executive_lines.append(
+                f"The primary business metric appears to be **{primary_metric}**, with a total value of **{total_metric:,.2f}**."
+            )
+
+        if segment_summary and primary_metric:
+            executive_lines.append(
+                f"The strongest contribution comes from **{segment_summary['strongest_name']}** in **{segment_summary['segment_col']}**, "
+                f"contributing **{segment_summary['strongest_value']:,.2f}** to {primary_metric}."
+            )
+            executive_lines.append(
+                f"The weakest contribution appears in **{segment_summary['weakest_name']}** under **{segment_summary['segment_col']}**, "
+                f"which may need further review."
+            )
+
+        executive_lines.append(
+            f"From a data quality perspective, the current filtered dataset contains **{missing_values} missing values** and **{duplicates} duplicate rows**."
+        )
+
+        st.markdown(" ".join(executive_lines))
 
         st.markdown("## Recommendations")
         recs = []
-        if strongest and category_col:
-            recs.append(f"1. Protect and replicate the strongest-performing segment: **{strongest[0]}** in **{category_col}**.")
-        if weakest and category_col:
-            recs.append(f"2. Investigate the weakest area: **{weakest[0]}** in **{category_col}** may need operational or retention review.")
-        corr = strongest_correlation(filtered_df, metric) if metric else None
-        if corr:
-            recs.append(f"3. Review the relationship between **{corr['column']}** and **{metric}** (correlation {corr['value']:.2f}) to identify controllable drivers.")
+        if segment_summary:
+            recs.append(
+                f"Protect and replicate the strongest-performing segment: **{segment_summary['strongest_name']}** in **{segment_summary['segment_col']}**."
+            )
+            recs.append(
+                f"Investigate the weakest area: **{segment_summary['weakest_name']}** in **{segment_summary['segment_col']}** may need operational or retention review."
+            )
 
-        for r in recs:
-            st.markdown(r)
+        outlier_risks = detect_outlier_risk(filtered_df, safe_metric_cols)
+        corr_pair = strongest_correlation(filtered_df, primary_metric, safe_metric_cols) if primary_metric else None
+        if corr_pair:
+            recs.append(
+                f"Review the relationship between **{corr_pair[0]}** and **{primary_metric}** (correlation {corr_pair[1]:.2f}) to identify controllable drivers."
+            )
+        if duplicates > 0:
+            recs.append("Remove duplicate records before presenting insights externally, as duplicates can distort totals and business conclusions.")
+
+        if not recs:
+            recs.append("No strong recommendation could be generated from the current filtered dataset.")
+
+        for idx, rec in enumerate(recs, 1):
+            st.markdown(f"{idx}. {rec}")
 
     with right:
         st.markdown("## Risk Alerts")
-        risk_msgs = []
+        if duplicates > 0:
+            st.markdown(f'<div class="warn-box">Duplicate-record risk detected: {duplicates} duplicate rows found.</div>', unsafe_allow_html=True)
 
-        dup_count = int(filtered_df.duplicated().sum())
-        if dup_count > 0:
-            risk_msgs.append(f"Duplicate-record risk detected: {dup_count} duplicate rows found.")
-
+        outlier_risks = detect_outlier_risk(filtered_df, safe_metric_cols)
         if outlier_risks:
-            for r in outlier_risks[:3]:
-                risk_msgs.append(r["message"])
-
-        if not risk_msgs:
-            risk_msgs.append("No major structural risk alerts detected in the current filtered dataset.")
-
-        for msg in risk_msgs:
-            st.markdown(f'<div class="main-card">{msg}</div>', unsafe_allow_html=True)
-
-    st.divider()
+            for risk in outlier_risks[:3]:
+                st.markdown(
+                    f'<div class="info-box">Outlier concentration in <b>{risk["column"]}</b> is elevated at {risk["outlier_ratio"] * 100:.1f}%.</div>',
+                    unsafe_allow_html=True
+                )
+        elif duplicates == 0:
+            st.markdown('<div class="good-box">No major duplicate or outlier risk was detected in the current filtered view.</div>', unsafe_allow_html=True)
 
     # Engines
+    st.markdown("---")
     st.markdown("## Insight Evaluation Layer")
-    st.caption("This section compares how different reasoning engines generate and score insights from the same filtered dataset.")
+    st.markdown("This section compares how different reasoning engines generate and score insights from the same filtered dataset.")
+
+    snippet_rows = get_evidence_rows(
+        filtered_df,
+        segment_summary["segment_col"] if segment_summary else None,
+        segment_summary["strongest_name"] if segment_summary else None,
+        primary_metric,
+        top_n=5
+    )
 
     all_insights = []
-    if metric and category_col:
-        all_insights.extend(rule_based_engine(filtered_df, metric, category_col, time_col, outlier_risks))
-        all_insights.extend(statistical_engine(filtered_df, metric, category_col, outlier_risks))
-        all_insights.extend(narrative_engine(filtered_df, metric, category_col))
-        all_insights.extend(gemini_engine(filtered_df, metric, category_col))
+    if primary_metric:
+        all_insights.extend(rule_based_engine(filtered_df, primary_metric, segment_summary, outlier_risks, date_col))
+        all_insights.extend(statistical_engine(filtered_df, primary_metric, safe_metric_cols, outlier_risks, date_col))
+        all_insights.extend(narrative_engine(filtered_df, primary_metric, segment_summary, quality_score))
+        all_insights.extend(gemini_engine(filtered_df, primary_metric, best_segment_col, snippet_rows))
 
-    all_insights = attach_evidence(filtered_df, all_insights, metric) if metric else []
+    benchmark_df = make_benchmark_table(all_insights)
 
-    if all_insights:
-        tabs = st.tabs(["Rule-Based Engine", "Statistical Engine", "Narrative Engine", "Gemini LLM Engine"])
+    if not benchmark_df.empty:
+        top_insights = benchmark_df.sort_values("Adjusted Final Score", ascending=False).head(5)
 
-        engine_names = ["Rule-Based Engine", "Statistical Engine", "Narrative Engine", "Gemini LLM Engine"]
+        for i, (_, row) in enumerate(top_insights.iterrows(), 1):
+            source_item = next((x for x in all_insights if x["engine"] == row["Engine"] and x["insight"] == row["Insight"]), None)
+            st.markdown(f"### {i}. {row['Insight']}")
+            st.markdown(f"- **Engine:** {row['Engine']}")
+            st.markdown(f"- **Adjusted Final Score:** {row['Adjusted Final Score']}")
+            if source_item:
+                st.markdown(f"- **Evidence:** {source_item['evidence']}")
+                ev_rows = get_evidence_rows(
+                    filtered_df,
+                    source_item.get("segment_col"),
+                    source_item.get("segment_value"),
+                    primary_metric,
+                    top_n=5
+                )
+                with st.expander("Inspect evidence rows"):
+                    st.dataframe(ev_rows, use_container_width=True)
 
-        for tab, engine_name in zip(tabs, engine_names):
-            with tab:
-                engine_items = [x for x in all_insights if x["engine"] == engine_name]
-                if not engine_items:
-                    st.info("No insights produced.")
-                    continue
-
-                for idx, ins in enumerate(engine_items, 1):
-                    st.markdown(f"### {idx}. {ins['insight']}")
-                    st.markdown(f"- **Engine:** {ins['engine']}")
-                    st.markdown(f"- **Adjusted Final Score:** {ins['adjusted_final_score']}")
-                    st.markdown(f"- **Evidence:** {ins['evidence_text']}")
-                    st.markdown(f"- **Base confidence:** {ins['base_confidence']}")
-
-                    with st.expander("Inspect evidence rows"):
-                        st.dataframe(ins["evidence_rows"], use_container_width=True)
-
-    st.divider()
-
-    # Benchmark table
-    if all_insights:
         st.markdown("## Benchmark Evaluation Table")
-        benchmark_df = build_benchmark_table(all_insights)
-        st.dataframe(benchmark_df, use_container_width=True, height=320)
+        st.dataframe(benchmark_df, use_container_width=True)
 
-        # Final verdict
         st.markdown("## Grounded Final Verdict")
-        final_insights = get_final_reliable_insights(all_insights, top_n=5)
+        final_top = benchmark_df.sort_values("Adjusted Final Score", ascending=False).head(5)
+        for i, (_, row) in enumerate(final_top.iterrows(), 1):
+            st.markdown(f"**{i}. {row['Insight']}**")
+            st.markdown(f"- Engine: {row['Engine']}")
+            st.markdown(f"- Adjusted Final Score: {row['Adjusted Final Score']}")
 
-        for i, ins in enumerate(final_insights, 1):
-            st.markdown(f"### {i}. {ins['insight']}")
-            st.markdown(f"- **Engine:** {ins['engine']}")
-            st.markdown(f"- **Adjusted Final Score:** {ins['adjusted_final_score']}")
-            st.markdown(f"- **Evidence:** {ins['evidence_text']}")
-
-            with st.expander("Inspect evidence rows"):
-                st.dataframe(ins["evidence_rows"], use_container_width=True)
-
-        avg_scores = (
-            benchmark_df.groupby("Engine")["Adjusted Final Score"]
-            .mean()
-            .sort_values(ascending=False)
-            .reset_index()
-        )
-
+        avg_scores = benchmark_df.groupby("Engine")["Adjusted Final Score"].mean().sort_values(ascending=False)
         st.markdown("## Average Insight Score by Engine")
-        fig_avg = px.bar(avg_scores, x="Engine", y="Adjusted Final Score")
+        fig_avg = px.bar(
+            avg_scores.reset_index(),
+            x="Engine",
+            y="Adjusted Final Score",
+            title="Average Insight Score by Engine"
+        )
         st.plotly_chart(fig_avg, use_container_width=True)
 
-        top_engine = avg_scores.iloc[0]["Engine"]
-        top_engine_score = avg_scores.iloc[0]["Adjusted Final Score"]
-        st.success(f"Top-performing engine in the current run: **{top_engine}** with an average score of **{top_engine_score:.1f}**.")
-
-    st.divider()
+        if not avg_scores.empty:
+            best_engine = avg_scores.index[0]
+            best_score = avg_scores.iloc[0]
+            st.markdown(
+                f'<div class="good-box">Top-performing engine in the current run: <b>{best_engine}</b> with an average score of <b>{best_score:.1f}</b>.</div>',
+                unsafe_allow_html=True
+            )
 
     # Ask your data
+    st.markdown("---")
     st.markdown("## Ask Your Data")
     question = st.text_input("Ask a grounded question about the current filtered dataset")
     if question:
-        answer = answer_grounded_question(filtered_df, question, metric, category_col)
-        st.info(answer)
+        answer = answer_grounded_question(question, filtered_df, primary_metric, segment_summary)
+        st.markdown(answer)
 
-    st.divider()
+    # Recommended charts
+    st.markdown("---")
+    render_recommended_visualization(filtered_df, primary_metric, date_col, best_segment_col)
 
-    render_recommended_visuals(filtered_df, metric, category_col, time_col)
+    # Heatmap
+    st.markdown("---")
+    render_correlation_heatmap(filtered_df, safe_metric_cols)
 
-    st.divider()
-
-    # Preview
+    # Preview + Downloads
+    st.markdown("---")
     st.markdown("## Preview Data")
-    st.dataframe(filtered_df.head(50), use_container_width=True, height=420)
+    st.dataframe(filtered_df.head(50), use_container_width=True)
 
-    # Downloads
-    cdl1, cdl2, cdl3 = st.columns(3)
-
-    with cdl1:
+    d1, d2 = st.columns(2)
+    with d1:
         st.download_button(
             "Download filtered dataset as CSV",
             data=to_csv_download(filtered_df),
             file_name="filtered_dataset.csv",
-            mime="text/csv",
+            mime="text/csv"
         )
 
-    with cdl2:
-        if all_insights:
-            insights_df = pd.DataFrame([
-                {
-                    "engine": x["engine"],
-                    "insight_type": x["insight_type"],
-                    "insight": x["insight"],
-                    "adjusted_final_score": x["adjusted_final_score"],
-                    "evidence": x["evidence_text"],
-                }
-                for x in all_insights
-            ])
-            st.download_button(
-                "Download insights report as CSV",
-                data=to_csv_download(insights_df),
-                file_name="insights_report.csv",
-                mime="text/csv",
-            )
-
-    with cdl3:
-        if all_insights:
-            benchmark_df = build_benchmark_table(all_insights)
+    with d2:
+        if not benchmark_df.empty:
             st.download_button(
                 "Download evaluation table as CSV",
                 data=to_csv_download(benchmark_df),
-                file_name="evaluation_table.csv",
-                mime="text/csv",
+                file_name="benchmark_evaluation_table.csv",
+                mime="text/csv"
             )
+
+    st.markdown("---")
+    st.caption("Next research upgrade: retrieval-backed evidence grounding, structured JSON insight contracts, benchmark datasets, and safer LLM failure handling.")
 
 
 if __name__ == "__main__":

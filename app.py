@@ -1,938 +1,1702 @@
+import os
+import re
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except Exception:
+    GEMINI_AVAILABLE = False
 
-# =========================
-# Page config
-# =========================
+
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 st.set_page_config(
     page_title="Client Intelligence Platform",
     page_icon="📊",
-    layout="wide",
+    layout="wide"
 )
 
-
-# =========================
-# Styling
-# =========================
-st.markdown(
-    """
-    <style>
-        .main-title {
-            font-size: 2.6rem;
-            font-weight: 800;
-            margin-bottom: 0.4rem;
-        }
-        .subtitle {
-            color: #9aa4b2;
-            font-size: 1.05rem;
-            margin-bottom: 1.2rem;
-        }
-        .section-card {
-            padding: 1rem 1.1rem;
-            border-radius: 14px;
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.08);
-            margin-bottom: 1rem;
-        }
-        .small-note {
-            color: #96a0ad;
-            font-size: 0.9rem;
-        }
-        .risk-box {
-            padding: 0.9rem 1rem;
-            border-radius: 12px;
-            margin-bottom: 0.6rem;
-        }
-        .risk-high {
-            background: rgba(255, 99, 71, 0.14);
-            border: 1px solid rgba(255, 99, 71, 0.35);
-        }
-        .risk-medium {
-            background: rgba(255, 165, 0, 0.13);
-            border: 1px solid rgba(255, 165, 0, 0.35);
-        }
-        .risk-low {
-            background: rgba(0, 191, 255, 0.12);
-            border: 1px solid rgba(0, 191, 255, 0.28);
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<style>
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    .card {
+        padding: 1rem 1.1rem;
+        border-radius: 16px;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        margin-bottom: 0.75rem;
+    }
+    .muted {
+        color: #9aa0a6;
+        font-size: 0.92rem;
+    }
+    .section-gap {
+        margin-top: 1rem;
+        margin-bottom: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
-# =========================
-# Utility helpers
-# =========================
-def infer_column_types(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str], List[str]]:
-    """Return numeric, categorical, datetime, identifier-like columns."""
-    working = df.copy()
-
-    for col in working.columns:
-        if working[col].dtype == "object":
-            parsed = pd.to_datetime(working[col], errors="coerce")
-            if parsed.notna().mean() > 0.7:
-                working[col] = parsed
-
-    numeric_cols = [c for c in working.columns if pd.api.types.is_numeric_dtype(working[c])]
-    datetime_cols = [c for c in working.columns if pd.api.types.is_datetime64_any_dtype(working[c])]
-
-    identifier_cols = []
-    categorical_cols = []
-    row_count = max(len(working), 1)
-
-    for col in working.columns:
-        if col in numeric_cols or col in datetime_cols:
-            continue
-        nunique_ratio = working[col].nunique(dropna=True) / row_count
-        if nunique_ratio > 0.9 or col.lower().endswith(("id", "_id")):
-            identifier_cols.append(col)
-        else:
-            categorical_cols.append(col)
-
-    return numeric_cols, categorical_cols, datetime_cols, identifier_cols
+# =========================================================
+# UTILS
+# =========================================================
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
 
 
-def coerce_datetimes(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for col in out.columns:
-        if out[col].dtype == "object":
-            parsed = pd.to_datetime(out[col], errors="coerce")
-            if parsed.notna().mean() > 0.7:
-                out[col] = parsed
-    return out
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
-def load_uploaded_file(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded_file)
-    raise ValueError("Unsupported file type. Please upload CSV or XLSX.")
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return default
+        return int(value)
+    except Exception:
+        return default
 
 
-def create_sample_sales_data(rows: int = 500) -> pd.DataFrame:
-    rng = np.random.default_rng(42)
-    dates = pd.date_range("2024-01-01", periods=rows, freq="D")
-    regions = rng.choice(["North", "South", "East", "West"], size=rows, p=[0.27, 0.24, 0.22, 0.27])
-    categories = rng.choice(["Software", "Hardware", "Services"], size=rows, p=[0.45, 0.30, 0.25])
-    segments = rng.choice(["SMB", "Mid-Market", "Enterprise"], size=rows, p=[0.5, 0.3, 0.2])
-    orders = rng.integers(10, 120, size=rows)
-    avg_ticket = rng.normal(220, 45, size=rows).clip(40, None)
-    revenue = orders * avg_ticket
-    cost = revenue * rng.uniform(0.45, 0.78, size=rows)
-    profit = revenue - cost
-    satisfaction = rng.normal(4.1, 0.45, size=rows).clip(2.0, 5.0)
-
-    df = pd.DataFrame(
-        {
-            "Date": dates,
-            "Region": regions,
-            "Category": categories,
-            "Customer Segment": segments,
-            "Orders": orders,
-            "Average Ticket": avg_ticket.round(2),
-            "Revenue": revenue.round(2),
-            "Cost": cost.round(2),
-            "Profit": profit.round(2),
-            "Satisfaction Score": satisfaction.round(2),
-        }
-    )
-
-    sample_idx = rng.choice(df.index, size=12, replace=False)
-    df.loc[sample_idx[:5], "Revenue"] = np.nan
-    df.loc[sample_idx[5:8], "Region"] = np.nan
-    df = pd.concat([df, df.sample(3, random_state=7)], ignore_index=True)
-    return df
-
-
-def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+def to_csv_download(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
-def compute_data_quality_score(df: pd.DataFrame) -> int:
-    if df.empty:
-        return 0
+def looks_boolean_like(series: pd.Series) -> bool:
+    try:
+        non_null = series.dropna()
+        if non_null.empty:
+            return False
 
-    missing_ratio = df.isna().sum().sum() / (df.shape[0] * df.shape[1]) if df.shape[0] and df.shape[1] else 0
-    duplicate_ratio = df.duplicated().mean() if len(df) else 0
+        if pd.api.types.is_bool_dtype(non_null):
+            return True
 
-    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-    outlier_penalty = 0.0
-    if numeric_cols:
-        penalties = []
+        numeric = pd.to_numeric(non_null, errors="coerce").dropna()
+        if not numeric.empty:
+            vals = set(numeric.unique().tolist())
+            if vals.issubset({0, 1}):
+                return True
+
+        lowered = set(non_null.astype(str).str.strip().str.lower().unique().tolist())
+        bool_words = {"true", "false", "yes", "no", "y", "n", "0", "1"}
+        if lowered and lowered.issubset(bool_words):
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
+def format_number(value: float) -> str:
+    value = safe_float(value, 0.0)
+    return f"{value:,.2f}"
+
+
+def safe_unique_ratio(series: pd.Series) -> float:
+    try:
+        return series.nunique(dropna=True) / max(len(series), 1)
+    except Exception:
+        return 1.0
+
+
+# =========================================================
+# COLUMN INFERENCE
+# =========================================================
+def infer_date_column(df: pd.DataFrame) -> Optional[str]:
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            return col
+
+    for col in df.columns:
+        try:
+            if df[col].dtype == "object":
+                sample = df[col].dropna().astype(str).head(100)
+                if sample.empty:
+                    continue
+                parsed = pd.to_datetime(sample, errors="coerce")
+                if parsed.notna().mean() >= 0.7:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+                    return col
+        except Exception:
+            continue
+
+    return None
+
+
+def add_time_features(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFrame:
+    if not date_col or date_col not in df.columns:
+        return df
+
+    temp = df.copy()
+    temp[date_col] = pd.to_datetime(temp[date_col], errors="coerce")
+    if temp[date_col].notna().sum() == 0:
+        return temp
+
+    try:
+        if "year" not in temp.columns:
+            temp["year"] = temp[date_col].dt.year
+        if "month" not in temp.columns:
+            temp["month"] = temp[date_col].dt.month
+        if "week_of_year" not in temp.columns:
+            temp["week_of_year"] = temp[date_col].dt.isocalendar().week.astype("Int64")
+        if "day_of_week" not in temp.columns:
+            temp["day_of_week"] = temp[date_col].dt.dayofweek
+        if "hour" not in temp.columns:
+            temp["hour"] = temp[date_col].dt.hour
+        if "is_weekend" not in temp.columns:
+            temp["is_weekend"] = temp[date_col].dt.dayofweek.isin([5, 6]).astype(int)
+    except Exception:
+        pass
+
+    return temp
+
+
+def infer_numeric_columns(df: pd.DataFrame) -> List[str]:
+    numeric_cols = []
+
+    for col in df.columns:
+        try:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                continue
+
+            if pd.api.types.is_bool_dtype(df[col]):
+                continue
+
+            if pd.api.types.is_numeric_dtype(df[col]):
+                if not looks_boolean_like(df[col]):
+                    numeric_cols.append(col)
+                continue
+
+            if df[col].dtype == "object":
+                converted = pd.to_numeric(df[col], errors="coerce")
+                if converted.notna().mean() > 0.8 and not looks_boolean_like(converted):
+                    numeric_cols.append(col)
+        except Exception:
+            continue
+
+    return numeric_cols
+
+
+def infer_categorical_columns(df: pd.DataFrame, numeric_cols: List[str], date_col: Optional[str]) -> List[str]:
+    cat_cols = []
+    for col in df.columns:
+        try:
+            if col in numeric_cols:
+                continue
+            if date_col and col == date_col:
+                continue
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                continue
+            if safe_unique_ratio(df[col]) < 0.7:
+                cat_cols.append(col)
+        except Exception:
+            continue
+    return cat_cols
+
+
+def infer_primary_metric(df: pd.DataFrame, numeric_cols: List[str]) -> Optional[str]:
+    if not numeric_cols:
+        return None
+
+    priority = [
+        "sales_amount_gbp", "sales_amount", "revenue", "sales", "profit",
+        "gmv", "amount", "ad_spend", "conversions", "clicks", "impressions",
+        "roas", "ctr", "cpa", "cost", "quantity"
+    ]
+
+    for keyword in priority:
         for col in numeric_cols:
-            series = df[col].dropna()
+            if keyword in col.lower():
+                return col
+
+    best_col = None
+    best_score = -1
+    for col in numeric_cols:
+        try:
+            score = pd.to_numeric(df[col], errors="coerce").notna().sum()
+            if score > best_score:
+                best_score = score
+                best_col = col
+        except Exception:
+            continue
+    return best_col
+
+
+def get_safe_numeric_columns(df: pd.DataFrame, numeric_cols: List[str]) -> List[str]:
+    safe_cols = []
+    for col in numeric_cols:
+        try:
+            if col not in df.columns:
+                continue
+            if pd.api.types.is_bool_dtype(df[col]):
+                continue
+            series = pd.to_numeric(df[col], errors="coerce").dropna()
             if len(series) < 5:
                 continue
-            q1, q3 = series.quantile([0.25, 0.75])
-            iqr = q3 - q1
-            if iqr == 0:
+            if looks_boolean_like(series):
                 continue
-            lower = q1 - 1.5 * iqr
-            upper = q3 + 1.5 * iqr
-            outlier_rate = ((series < lower) | (series > upper)).mean()
-            penalties.append(outlier_rate)
-        outlier_penalty = float(np.mean(penalties)) if penalties else 0.0
+            safe_cols.append(col)
+        except Exception:
+            continue
+    return safe_cols
+
+
+# =========================================================
+# DATA QUALITY
+# =========================================================
+def compute_data_quality_score(df: pd.DataFrame) -> int:
+    missing_pct = (df.isna().sum().sum() / max(df.size, 1)) * 100
+    duplicate_pct = (df.duplicated().sum() / max(len(df), 1)) * 100
 
     score = 100
-    score -= missing_ratio * 45
-    score -= duplicate_ratio * 30
-    score -= outlier_penalty * 25
-    return max(0, min(100, int(round(score))))
+    score -= min(40, missing_pct * 2)
+    score -= min(25, duplicate_pct * 2)
+    return int(max(0, min(100, round(score))))
 
 
-def get_primary_metric(numeric_cols: List[str]) -> Optional[str]:
-    preferred = ["revenue", "sales", "profit", "amount", "value", "orders", "cost", "quantity"]
-    lowered = {c.lower(): c for c in numeric_cols}
-    for key in preferred:
-        for col_lower, original in lowered.items():
-            if key in col_lower:
-                return original
-    return numeric_cols[0] if numeric_cols else None
+def detect_outlier_risk(df: pd.DataFrame, numeric_cols: List[str]) -> List[Dict[str, Any]]:
+    risks = []
 
+    for col in numeric_cols[:25]:
+        try:
+            if col not in df.columns:
+                continue
 
-def get_primary_datetime(datetime_cols: List[str]) -> Optional[str]:
-    preferred = ["date", "time", "month", "year"]
-    lowered = {c.lower(): c for c in datetime_cols}
-    for key in preferred:
-        for col_lower, original in lowered.items():
-            if key in col_lower:
-                return original
-    return datetime_cols[0] if datetime_cols else None
+            if pd.api.types.is_bool_dtype(df[col]):
+                continue
 
+            series = pd.to_numeric(df[col], errors="coerce").dropna()
 
-def top_category_by_metric(df: pd.DataFrame, cat_cols: List[str], metric: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[float]]:
-    if not cat_cols or not metric or metric not in df.columns:
-        return None, None, None
+            if len(series) < 10:
+                continue
 
-    best_col = None
-    best_value = -np.inf
-    best_category = None
+            if looks_boolean_like(series):
+                continue
 
-    for col in cat_cols:
-        grouped = df.groupby(col, dropna=False)[metric].sum(numeric_only=True)
-        if grouped.empty:
+            series = series.astype(float)
+
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+
+            if pd.isna(iqr) or iqr == 0:
+                continue
+
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+
+            outliers = series[(series < lower) | (series > upper)]
+            outlier_pct = (len(outliers) / len(series)) * 100
+
+            if outlier_pct >= 5:
+                risks.append({
+                    "column": col,
+                    "outlier_pct": round(outlier_pct, 1)
+                })
+        except Exception:
             continue
-        local_best_category = grouped.idxmax()
-        local_best_value = grouped.max()
-        if local_best_value > best_value:
-            best_value = float(local_best_value)
-            best_category = str(local_best_category)
-            best_col = col
 
-    return best_col, best_category, best_value if best_col is not None else None
+    return sorted(risks, key=lambda x: x["outlier_pct"], reverse=True)[:5]
 
 
-def worst_category_by_metric(df: pd.DataFrame, cat_cols: List[str], metric: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[float]]:
-    if not cat_cols or not metric or metric not in df.columns:
-        return None, None, None
-
-    worst_col = None
-    worst_value = np.inf
-    worst_category = None
-
-    for col in cat_cols:
-        grouped = df.groupby(col, dropna=False)[metric].sum(numeric_only=True)
-        if grouped.empty:
+def detect_category_imbalance(df: pd.DataFrame, categorical_columns: List[str]) -> List[Dict[str, Any]]:
+    alerts = []
+    for col in categorical_columns[:10]:
+        try:
+            vc = df[col].astype(str).value_counts(dropna=False, normalize=True)
+            if vc.empty:
+                continue
+            top_share = vc.iloc[0] * 100
+            if top_share >= 90:
+                alerts.append({
+                    "column": col,
+                    "top_share": round(top_share, 1)
+                })
+        except Exception:
             continue
-        local_worst_category = grouped.idxmin()
-        local_worst_value = grouped.min()
-        if local_worst_value < worst_value:
-            worst_value = float(local_worst_value)
-            worst_category = str(local_worst_category)
-            worst_col = col
-
-    return worst_col, worst_category, worst_value if worst_col is not None else None
+    return alerts[:5]
 
 
-def calculate_metric_trend(df: pd.DataFrame, metric: str, date_col: str) -> Dict[str, Optional[float]]:
-    temp = df[[date_col, metric]].dropna().copy()
-    if temp.empty:
-        return {"pct_change": None, "direction": None, "monthly": None}
+# =========================================================
+# ANALYSIS HELPERS
+# =========================================================
+def detect_best_dimension(df: pd.DataFrame, metric_col: str, categorical_columns: List[str]) -> Tuple[Optional[str], Optional[str], float]:
+    best_dim, best_entity, best_value = None, None, -np.inf
 
-    temp = temp.sort_values(date_col)
-    temp["period"] = temp[date_col].dt.to_period("M").astype(str)
-    monthly = temp.groupby("period")[metric].sum(numeric_only=True)
-    if len(monthly) < 2:
-        return {"pct_change": None, "direction": None, "monthly": monthly}
-
-    first_val = monthly.iloc[0]
-    last_val = monthly.iloc[-1]
-    if first_val == 0:
-        return {"pct_change": None, "direction": None, "monthly": monthly}
-
-    pct_change = ((last_val - first_val) / abs(first_val)) * 100
-    direction = "up" if pct_change >= 0 else "down"
-    return {"pct_change": float(pct_change), "direction": direction, "monthly": monthly}
-
-
-def get_strongest_correlation(df: pd.DataFrame, numeric_cols: List[str]) -> Optional[Tuple[str, str, float]]:
-    if len(numeric_cols) < 2:
-        return None
-    corr = df[numeric_cols].corr(numeric_only=True)
-    if corr.empty:
-        return None
-    pairs = corr.where(~np.eye(corr.shape[0], dtype=bool)).stack().sort_values(key=lambda s: s.abs(), ascending=False)
-    if pairs.empty:
-        return None
-    a, b = pairs.index[0]
-    return str(a), str(b), float(pairs.iloc[0])
-
-
-def get_outlier_signal(df: pd.DataFrame, numeric_cols: List[str]) -> Optional[Tuple[str, float]]:
-    best_col = None
-    best_rate = 0.0
-    for col in numeric_cols:
-        series = df[col].dropna()
-        if len(series) < 8:
+    for col in categorical_columns[:8]:
+        try:
+            grouped = df.groupby(col, dropna=False)[metric_col].sum().sort_values(ascending=False)
+            if not grouped.empty:
+                entity = str(grouped.index[0])
+                value = float(grouped.iloc[0])
+                if value > best_value:
+                    best_dim, best_entity, best_value = col, entity, value
+        except Exception:
             continue
-        q1, q3 = series.quantile([0.25, 0.75])
-        iqr = q3 - q1
-        if iqr == 0:
+
+    if best_dim is None:
+        return None, None, 0.0
+    return best_dim, best_entity, best_value
+
+
+def detect_weakest_dimension(df: pd.DataFrame, metric_col: str, categorical_columns: List[str]) -> Tuple[Optional[str], Optional[str], float]:
+    weak_dim, weak_entity, weak_value = None, None, np.inf
+
+    for col in categorical_columns[:8]:
+        try:
+            grouped = df.groupby(col, dropna=False)[metric_col].sum().sort_values(ascending=True)
+            if not grouped.empty:
+                entity = str(grouped.index[0])
+                value = float(grouped.iloc[0])
+                if value < weak_value:
+                    weak_dim, weak_entity, weak_value = col, entity, value
+        except Exception:
             continue
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        outlier_rate = ((series < lower) | (series > upper)).mean()
-        if outlier_rate > best_rate:
-            best_rate = float(outlier_rate)
-            best_col = col
-    if best_col is None:
+
+    if weak_dim is None:
+        return None, None, 0.0
+    return weak_dim, weak_entity, weak_value
+
+
+def month_trend_stats(df: pd.DataFrame, date_col: Optional[str], metric_col: str) -> Dict[str, Any]:
+    result = {
+        "monthly_series": pd.Series(dtype=float),
+        "first_value": None,
+        "last_value": None,
+        "pct_change": None,
+        "direction": "none"
+    }
+
+    if not date_col or date_col not in df.columns:
+        return result
+
+    try:
+        temp = df.copy()
+        temp[date_col] = pd.to_datetime(temp[date_col], errors="coerce")
+        temp = temp.dropna(subset=[date_col])
+
+        if temp.empty:
+            return result
+
+        monthly = temp.set_index(date_col)[metric_col].resample("M").sum().dropna()
+        result["monthly_series"] = monthly
+
+        if len(monthly) >= 2:
+            first_val = float(monthly.iloc[0])
+            last_val = float(monthly.iloc[-1])
+            result["first_value"] = first_val
+            result["last_value"] = last_val
+
+            if first_val != 0:
+                pct = ((last_val - first_val) / abs(first_val)) * 100
+                result["pct_change"] = pct
+                if pct > 0:
+                    result["direction"] = "up"
+                elif pct < 0:
+                    result["direction"] = "down"
+
+        return result
+    except Exception:
+        return result
+
+
+# =========================================================
+# RETRIEVAL-BACKED EVIDENCE
+# =========================================================
+def retrieve_evidence_rows(
+    df: pd.DataFrame,
+    metric_col: str,
+    dimension: Optional[str] = None,
+    entity: Optional[str] = None,
+    top_n: int = 5
+) -> pd.DataFrame:
+    try:
+        temp = df.copy()
+
+        if dimension and entity and dimension in temp.columns:
+            temp = temp[temp[dimension].astype(str) == str(entity)]
+
+        if metric_col in temp.columns:
+            temp["_metric_sort"] = pd.to_numeric(temp[metric_col], errors="coerce").fillna(0)
+            temp = temp.sort_values("_metric_sort", ascending=False).drop(columns=["_metric_sort"], errors="ignore")
+
+        return temp.head(top_n)
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_evidence_text(insight: Dict[str, Any], df: pd.DataFrame, metric_col: str) -> str:
+    metric = insight.get("metric")
+    dimension = insight.get("dimension")
+    entity = insight.get("entity")
+
+    try:
+        if metric and dimension and entity and metric in df.columns and dimension in df.columns:
+            subset = df[df[dimension].astype(str) == str(entity)]
+            if not subset.empty:
+                total_val = pd.to_numeric(subset[metric], errors="coerce").fillna(0).sum()
+                avg_val = pd.to_numeric(subset[metric], errors="coerce").fillna(0).mean()
+                return (
+                    f"Grounded from filtered dataset: {dimension}={entity}, "
+                    f"rows={len(subset)}, total_{metric}={round(float(total_val),2)}, "
+                    f"avg_{metric}={round(float(avg_val),2)}."
+                )
+
+        if metric and metric in df.columns:
+            metric_series = pd.to_numeric(df[metric], errors="coerce").dropna()
+            if not metric_series.empty:
+                return (
+                    f"Grounded from filtered dataset: rows={len(df)}, "
+                    f"sum_{metric}={round(float(metric_series.sum()),2)}, "
+                    f"mean_{metric}={round(float(metric_series.mean()),2)}."
+                )
+    except Exception:
+        pass
+
+    return "Grounded from current filtered dataset."
+
+
+# =========================================================
+# GEMINI
+# =========================================================
+def clean_json_text(raw_text: str) -> str:
+    if not raw_text:
+        return ""
+    text = raw_text.strip()
+    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        text = text[first_brace:last_brace + 1]
+    return text.strip()
+
+
+def safe_parse_json(raw_text: str) -> Optional[Dict[str, Any]]:
+    cleaned = clean_json_text(raw_text)
+    if not cleaned:
         return None
-    return best_col, best_rate
+
+    candidates = [
+        cleaned,
+        re.sub(r",\s*([}\]])", r"\1", cleaned),
+        cleaned.replace("“", '"').replace("”", '"')
+    ]
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
+    return None
 
 
-def classify_insight(insight: str) -> str:
-    text = insight.lower()
-    if any(word in text for word in ["missing", "duplicate", "risk", "outlier", "decline", "drop", "weak", "imbalance"]):
-        return "risk"
-    if any(word in text for word in ["recommend", "focus", "investigate", "prioritize", "review", "protect"]):
-        return "recommendation"
-    if any(word in text for word in ["correlation", "trend", "increase", "decrease", "grew", "improved", "strongest"]):
+def build_dataset_context(df: pd.DataFrame, metric_col: str, date_col: Optional[str], categorical_cols: List[str], numeric_cols: List[str]) -> str:
+    lines = []
+    lines.append(f"Rows: {len(df)}")
+    lines.append(f"Columns: {list(df.columns)}")
+    lines.append(f"Primary metric: {metric_col}")
+    lines.append(f"Missing values: {int(df.isna().sum().sum())}")
+    lines.append(f"Duplicate rows: {int(df.duplicated().sum())}")
+
+    metric_series = pd.to_numeric(df[metric_col], errors="coerce").dropna()
+    if not metric_series.empty:
+        lines.append(f"{metric_col} total: {round(float(metric_series.sum()),2)}")
+        lines.append(f"{metric_col} mean: {round(float(metric_series.mean()),2)}")
+        lines.append(f"{metric_col} median: {round(float(metric_series.median()),2)}")
+
+    if date_col and date_col in df.columns:
+        temp = df.copy()
+        temp[date_col] = pd.to_datetime(temp[date_col], errors="coerce")
+        temp = temp.dropna(subset=[date_col])
+        if not temp.empty:
+            lines.append(f"Date range: {temp[date_col].min()} to {temp[date_col].max()}")
+            monthly = temp.set_index(date_col)[metric_col].resample("M").sum().dropna()
+            if len(monthly) >= 2:
+                first_val = float(monthly.iloc[0])
+                last_val = float(monthly.iloc[-1])
+                if first_val != 0:
+                    pct = ((last_val - first_val) / abs(first_val)) * 100
+                    lines.append(
+                        f"Monthly trend: first={round(first_val,2)}, last={round(last_val,2)}, pct_change={round(pct,2)}"
+                    )
+
+    for col in categorical_cols[:5]:
+        try:
+            grouped = df.groupby(col, dropna=False)[metric_col].sum().sort_values(ascending=False).head(5)
+            if not grouped.empty:
+                lines.append(f"Top categories for {col}:")
+                for idx, val in grouped.items():
+                    lines.append(f"- {col}={idx}: {round(float(val),2)}")
+        except Exception:
+            continue
+
+    for col in numeric_cols[:6]:
+        if col == metric_col:
+            continue
+        try:
+            corr_df = df[[metric_col, col]].apply(pd.to_numeric, errors="coerce").dropna()
+            if len(corr_df) >= 10:
+                corr_val = corr_df.corr(numeric_only=True).iloc[0, 1]
+                if not pd.isna(corr_val):
+                    lines.append(f"Correlation with {metric_col}: {col}={round(float(corr_val),2)}")
+        except Exception:
+            continue
+
+    return "\n".join(lines)
+
+
+def build_gemini_prompt(dataset_context: str, user_question: Optional[str] = None) -> str:
+    question_block = f"\nUser question: {user_question}\n" if user_question else ""
+    return f"""
+You are a senior business data analyst.
+
+Return ONLY valid JSON.
+
+Schema:
+{{
+  "insights": [
+    {{
+      "title": "short title",
+      "statement": "single grounded finding",
+      "insight_type": "trend|risk|recommendation|general",
+      "metric": "metric name or null",
+      "dimension": "dimension name or null",
+      "entity": "entity value or null",
+      "direction": "up|down|high|low|mixed|none",
+      "evidence": "specific evidence from the context",
+      "base_confidence": 0
+    }}
+  ]
+}}
+
+Rules:
+1. Give 3 to 5 insights.
+2. Use only the dataset context.
+3. Do not invent unavailable facts.
+4. Keep findings grounded.
+5. Avoid internal contradiction.
+
+Dataset context:
+{dataset_context}
+{question_block}
+""".strip()
+
+
+def run_gemini_engine(dataset_context: str, user_question: Optional[str] = None) -> Dict[str, Any]:
+    if not GEMINI_AVAILABLE:
+        return {"status": "unavailable", "error": "google-generativeai not installed", "insights": []}
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {"status": "unavailable", "error": "GEMINI_API_KEY not set", "insights": []}
+
+    try:
+        genai.configure(api_key=api_key)
+        candidate_models = ["gemini-1.5-flash", "gemini-1.5-pro"]
+        last_error = None
+
+        for model_name in candidate_models:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(
+                    build_gemini_prompt(dataset_context, user_question),
+                    generation_config={"temperature": 0.2, "max_output_tokens": 1200}
+                )
+                raw_text = getattr(response, "text", "") or ""
+                parsed = safe_parse_json(raw_text)
+
+                if not parsed or "insights" not in parsed:
+                    last_error = f"{model_name} returned invalid JSON"
+                    continue
+
+                output = []
+                for item in parsed.get("insights", []):
+                    output.append({
+                        "engine": "Gemini LLM Engine",
+                        "title": str(item.get("title", "Gemini Insight")).strip(),
+                        "statement": str(item.get("statement", "")).strip(),
+                        "insight_type": str(item.get("insight_type", "general")).strip().lower(),
+                        "metric": item.get("metric"),
+                        "dimension": item.get("dimension"),
+                        "entity": item.get("entity"),
+                        "direction": str(item.get("direction", "none")).strip().lower(),
+                        "evidence": str(item.get("evidence", "Grounded from filtered dataset.")).strip(),
+                        "base_confidence": max(0, min(100, safe_int(item.get("base_confidence", 60), 60)))
+                    })
+
+                if output:
+                    return {"status": "ok", "error": None, "insights": output}
+
+            except Exception as model_error:
+                last_error = str(model_error)
+                continue
+
+        return {"status": "failed", "error": last_error or "Gemini failed", "insights": []}
+
+    except Exception as e:
+        return {"status": "failed", "error": str(e), "insights": []}
+
+
+# =========================================================
+# ENGINES
+# =========================================================
+def build_rule_based_insights(df: pd.DataFrame, metric_col: str, date_col: Optional[str], cat_cols: List[str]) -> List[Dict[str, Any]]:
+    insights = []
+
+    best_dim, best_entity, best_value = detect_best_dimension(df, metric_col, cat_cols)
+    weak_dim, weak_entity, weak_value = detect_weakest_dimension(df, metric_col, cat_cols)
+    trend = month_trend_stats(df, date_col, metric_col)
+    duplicate_count = int(df.duplicated().sum())
+
+    if best_dim and best_entity:
+        insights.append({
+            "engine": "Rule-Based Engine",
+            "title": "Strongest segment",
+            "statement": f"The strongest driver of {metric_col} is {best_entity} within {best_dim}, contributing {best_value:,.2f} overall.",
+            "insight_type": "trend",
+            "metric": metric_col,
+            "dimension": best_dim,
+            "entity": best_entity,
+            "direction": "high",
+            "base_confidence": 88
+        })
+
+    if weak_dim and weak_entity:
+        insights.append({
+            "engine": "Rule-Based Engine",
+            "title": "Weakest segment",
+            "statement": f"Underperformance appears in {weak_entity} under {weak_dim}, making it a priority area for review.",
+            "insight_type": "recommendation",
+            "metric": metric_col,
+            "dimension": weak_dim,
+            "entity": weak_entity,
+            "direction": "low",
+            "base_confidence": 84
+        })
+
+    if trend["pct_change"] is not None:
+        word = "improved" if trend["pct_change"] > 0 else "declined"
+        insights.append({
+            "engine": "Rule-Based Engine",
+            "title": "Time trend",
+            "statement": f"Over time, {metric_col} has {word} by {abs(trend['pct_change']):.1f}% from the first month to the latest month.",
+            "insight_type": "trend",
+            "metric": metric_col,
+            "dimension": "time",
+            "entity": "monthly",
+            "direction": trend["direction"],
+            "base_confidence": 90
+        })
+
+    if duplicate_count > 0:
+        insights.append({
+            "engine": "Rule-Based Engine",
+            "title": "Duplicate risk",
+            "statement": f"Duplicate record risk detected: {duplicate_count} duplicate rows should be reviewed before external reporting.",
+            "insight_type": "risk",
+            "metric": None,
+            "dimension": "dataset",
+            "entity": "duplicates",
+            "direction": "high",
+            "base_confidence": 95
+        })
+
+    return insights[:5]
+
+
+def build_statistical_insights(df: pd.DataFrame, metric_col: str, date_col: Optional[str], safe_numeric_cols: List[str], cat_cols: List[str]) -> List[Dict[str, Any]]:
+    insights = []
+
+    num_df = df[safe_numeric_cols].apply(pd.to_numeric, errors="coerce")
+    corr = num_df.corr(numeric_only=True)
+
+    if metric_col in corr.columns:
+        metric_corr = corr[metric_col].drop(labels=[metric_col], errors="ignore").dropna()
+        if not metric_corr.empty:
+            strongest_feature = metric_corr.abs().sort_values(ascending=False).index[0]
+            strongest_value = corr.loc[strongest_feature, metric_col]
+            insights.append({
+                "engine": "Statistical Engine",
+                "title": "Strongest relationship",
+                "statement": f"The strongest statistical relationship is a {'positive' if strongest_value >= 0 else 'negative'} correlation of {strongest_value:.2f} between {strongest_feature} and {metric_col}.",
+                "insight_type": "trend",
+                "metric": metric_col,
+                "dimension": strongest_feature,
+                "entity": None,
+                "direction": "up" if strongest_value >= 0 else "down",
+                "base_confidence": 75
+            })
+
+    outlier_risks = detect_outlier_risk(df, safe_numeric_cols)
+    if outlier_risks:
+        top = outlier_risks[0]
+        insights.append({
+            "engine": "Statistical Engine",
+            "title": "Outlier concentration",
+            "statement": f"Outlier analysis shows that {top['column']} has the highest anomaly concentration at {top['outlier_pct']}%, which may distort averages and trends.",
+            "insight_type": "risk",
+            "metric": top["column"],
+            "dimension": "distribution",
+            "entity": None,
+            "direction": "high",
+            "base_confidence": 75
+        })
+
+    trend = month_trend_stats(df, date_col, metric_col)
+    monthly = trend["monthly_series"]
+
+    if len(monthly) >= 3:
+        recent = monthly.tail(3).reset_index(drop=True)
+        if recent.iloc[-1] < recent.iloc[0]:
+            text = f"Recent monthly movement for {metric_col} shows a downward direction across the latest observed periods."
+            direction = "down"
+        elif recent.iloc[-1] > recent.iloc[0]:
+            text = f"Recent monthly movement for {metric_col} shows an upward direction across the latest observed periods."
+            direction = "up"
+        else:
+            text = f"Recent monthly movement for {metric_col} appears stable across the latest observed periods."
+            direction = "none"
+
+        insights.append({
+            "engine": "Statistical Engine",
+            "title": "Recent movement",
+            "statement": text,
+            "insight_type": "general",
+            "metric": metric_col,
+            "dimension": "time",
+            "entity": "recent_months",
+            "direction": direction,
+            "base_confidence": 75
+        })
+
+    if cat_cols:
+        try:
+            col = cat_cols[0]
+            grouped = df.groupby(col)[metric_col].sum().sort_values(ascending=False)
+            if len(grouped) >= 2:
+                spread = float(grouped.iloc[0] - grouped.iloc[-1])
+                insights.append({
+                    "engine": "Statistical Engine",
+                    "title": "Category spread",
+                    "statement": f"Category spread analysis indicates a {spread:,.2f} gap between the strongest and weakest values in {col}.",
+                    "insight_type": "risk",
+                    "metric": metric_col,
+                    "dimension": col,
+                    "entity": None,
+                    "direction": "mixed",
+                    "base_confidence": 75
+                })
+        except Exception:
+            pass
+
+    return insights[:5]
+
+
+def build_narrative_insights(df: pd.DataFrame, metric_col: str, date_col: Optional[str], cat_cols: List[str], quality_score: int) -> List[Dict[str, Any]]:
+    insights = []
+
+    best_dim, best_entity, best_value = detect_best_dimension(df, metric_col, cat_cols)
+    weak_dim, weak_entity, weak_value = detect_weakest_dimension(df, metric_col, cat_cols)
+    trend = month_trend_stats(df, date_col, metric_col)
+
+    if trend["pct_change"] is not None:
+        if trend["pct_change"] > 0:
+            insights.append({
+                "engine": "Narrative Engine",
+                "title": "Momentum",
+                "statement": f"Narrative assessment suggests momentum is favorable because {metric_col} is trending upward over time, which may indicate healthy commercial performance.",
+                "insight_type": "trend",
+                "metric": metric_col,
+                "dimension": "time",
+                "entity": "monthly",
+                "direction": "up",
+                "base_confidence": 85
+            })
+        else:
+            insights.append({
+                "engine": "Narrative Engine",
+                "title": "Caution",
+                "statement": f"Narrative assessment suggests caution because {metric_col} is trending downward over time, which may reflect weakening demand or execution gaps.",
+                "insight_type": "risk",
+                "metric": metric_col,
+                "dimension": "time",
+                "entity": "monthly",
+                "direction": "down",
+                "base_confidence": 85
+            })
+
+    if best_dim and best_entity:
+        insights.append({
+            "engine": "Narrative Engine",
+            "title": "Growth segment",
+            "statement": f"From a business perspective, {best_entity} in {best_dim} appears to be a dependable growth segment that should be protected and scaled.",
+            "insight_type": "recommendation",
+            "metric": metric_col,
+            "dimension": best_dim,
+            "entity": best_entity,
+            "direction": "high",
+            "base_confidence": 75
+        })
+
+    if weak_dim and weak_entity:
+        insights.append({
+            "engine": "Narrative Engine",
+            "title": "Weak segment",
+            "statement": f"The weakest segment appears to be {weak_entity} in {weak_dim}, suggesting a need for targeted investigation and intervention.",
+            "insight_type": "risk",
+            "metric": metric_col,
+            "dimension": weak_dim,
+            "entity": weak_entity,
+            "direction": "low",
+            "base_confidence": 85
+        })
+
+    insights.append({
+        "engine": "Narrative Engine",
+        "title": "Confidence",
+        "statement": f"Decision confidence is relatively strong because the data quality score is {quality_score}/100, supporting more reliable interpretation.",
+        "insight_type": "general",
+        "metric": None,
+        "dimension": "dataset",
+        "entity": "quality",
+        "direction": "high",
+        "base_confidence": 85
+    })
+
+    return insights[:5]
+
+
+# =========================================================
+# CONTRADICTION + BENCHMARK LOGIC
+# =========================================================
+def get_subject_key(insight: Dict[str, Any]) -> str:
+    metric = normalize_text(insight.get("metric"))
+    dimension = normalize_text(insight.get("dimension"))
+    entity = normalize_text(insight.get("entity"))
+
+    if dimension == "time":
+        return f"{metric}|time"
+    if metric and dimension and entity:
+        return f"{metric}|{dimension}|{entity}"
+    if metric and dimension:
+        return f"{metric}|{dimension}"
+    return f"{metric}|{normalize_text(insight.get('insight_type'))}"
+
+
+def direction_bucket(direction: str) -> str:
+    d = normalize_text(direction)
+    if d in {"up", "high"}:
+        return "positive"
+    if d in {"down", "low"}:
+        return "negative"
+    return "neutral"
+
+
+def are_contradictory(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    if get_subject_key(a) != get_subject_key(b):
+        return False
+
+    da = direction_bucket(a.get("direction", "none"))
+    db = direction_bucket(b.get("direction", "none"))
+
+    if da == "neutral" or db == "neutral":
+        return False
+
+    return da != db
+
+
+def detect_contradictions(insights: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    contradictions = []
+    for i in range(len(insights)):
+        for j in range(i + 1, len(insights)):
+            a, b = insights[i], insights[j]
+            if are_contradictory(a, b):
+                contradictions.append({
+                    "insight_a": a,
+                    "insight_b": b,
+                    "reason": "Same subject with opposite directional claims."
+                })
+    return contradictions
+
+
+def score_insight(insight: Dict[str, Any], evidence_rows: pd.DataFrame, gemini_status: str) -> Dict[str, Any]:
+    statement = normalize_text(insight.get("statement"))
+    insight_type = normalize_text(insight.get("insight_type"))
+    base_confidence = float(insight.get("base_confidence", 60))
+
+    relevance = 75
+    actionability = 35
+    clarity = 80
+    consistency = 4.0
+    grounding = 80
+    evidence_coverage = 80
+
+    if "strongest" in statement or "correlation" in statement or "duplicate" in statement:
+        relevance = 85
+    elif insight_type == "general":
+        relevance = 45
+    elif "weakest" in statement or "underperformance" in statement:
+        relevance = 55
+
+    if insight_type == "recommendation":
+        actionability = 80
+    elif insight_type == "risk":
+        actionability = 55
+
+    if insight.get("engine") == "Narrative Engine":
+        clarity = 95
+    elif insight.get("engine") == "Gemini LLM Engine":
+        clarity = 85
+
+    if normalize_text(insight.get("direction")) == "mixed":
+        consistency = 3.2
+    elif normalize_text(insight.get("direction")) == "none":
+        consistency = 2.5
+
+    if evidence_rows is None or evidence_rows.empty:
+        grounding = 55
+        evidence_coverage = 45
+    else:
+        grounding = 90
+        evidence_coverage = min(100, 60 + len(evidence_rows) * 8)
+
+    llm_valid = "Yes" if gemini_status == "ok" else "Error"
+
+    final_score = (
+        0.18 * relevance +
+        0.15 * actionability +
+        0.12 * (consistency * 10) +
+        0.12 * clarity +
+        0.18 * base_confidence +
+        0.15 * grounding +
+        0.10 * evidence_coverage
+    )
+
+    if insight.get("engine") == "Gemini LLM Engine" and gemini_status != "ok":
+        final_score -= 20
+
+    insight["relevance"] = relevance
+    insight["actionability"] = actionability
+    insight["consistency"] = round(consistency, 1)
+    insight["clarity"] = clarity
+    insight["grounding"] = grounding
+    insight["evidence_coverage"] = evidence_coverage
+    insight["llm_valid"] = llm_valid
+    insight["final_score"] = round(final_score, 1)
+
+    return insight
+
+
+def build_final_reliable_insights(insights: List[Dict[str, Any]], contradictions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    contradiction_statements = set()
+    for c in contradictions:
+        contradiction_statements.add(c["insight_a"]["statement"])
+        contradiction_statements.add(c["insight_b"]["statement"])
+
+    output = []
+    for insight in insights:
+        penalty = 10 if insight["statement"] in contradiction_statements else 0
+        adjusted = insight.get("final_score", 0) - penalty
+        temp = dict(insight)
+        temp["adjusted_final_score"] = round(adjusted, 1)
+        output.append(temp)
+
+    output = sorted(output, key=lambda x: x["adjusted_final_score"], reverse=True)
+    return output[:5]
+
+
+# =========================================================
+# AGENT Q&A
+# =========================================================
+def classify_question(question: str) -> str:
+    q = normalize_text(question)
+
+    if any(word in q for word in ["top", "best", "highest", "strongest"]):
+        return "top_segment"
+    if any(word in q for word in ["worst", "weakest", "lowest", "underperform"]):
+        return "weak_segment"
+    if any(word in q for word in ["trend", "over time", "increase", "decrease", "growth", "decline"]):
         return "trend"
+    if any(word in q for word in ["correlation", "relationship", "driver"]):
+        return "correlation"
+    if any(word in q for word in ["risk", "anomaly", "outlier", "issue"]):
+        return "risk"
     return "general"
 
 
-def agreement_label(score: float) -> str:
-    if score >= 80:
-        return "High"
-    if score >= 60:
-        return "Medium"
-    return "Low"
+def answer_question_with_rules(
+    question: str,
+    df: pd.DataFrame,
+    metric_col: str,
+    date_col: Optional[str],
+    cat_cols: List[str],
+    safe_numeric_cols: List[str]
+) -> Tuple[str, pd.DataFrame, int]:
+    qtype = classify_question(question)
+
+    if qtype == "top_segment":
+        best_dim, best_entity, best_value = detect_best_dimension(df, metric_col, cat_cols)
+        if best_dim and best_entity:
+            evidence = retrieve_evidence_rows(df, metric_col, best_dim, best_entity, top_n=5)
+            answer = f"The strongest segment is {best_entity} within {best_dim}, contributing {best_value:,.2f} to {metric_col}."
+            return answer, evidence, 88
+
+    if qtype == "weak_segment":
+        weak_dim, weak_entity, weak_value = detect_weakest_dimension(df, metric_col, cat_cols)
+        if weak_dim and weak_entity:
+            evidence = retrieve_evidence_rows(df, metric_col, weak_dim, weak_entity, top_n=5)
+            answer = f"The weakest segment is {weak_entity} within {weak_dim}, which contributes the lowest observed total to {metric_col}."
+            return answer, evidence, 84
+
+    if qtype == "trend":
+        trend = month_trend_stats(df, date_col, metric_col)
+        monthly = trend["monthly_series"]
+        if len(monthly) >= 2:
+            direction = "upward" if trend["pct_change"] and trend["pct_change"] > 0 else "downward"
+            answer = f"The monthly trend for {metric_col} is {direction}, with a change of {abs(trend['pct_change']):.1f}% from the first observed month to the latest one."
+            evidence = monthly.reset_index().tail(6)
+            return answer, evidence, 86
+
+    if qtype == "correlation":
+        if metric_col in safe_numeric_cols:
+            num_df = df[safe_numeric_cols].apply(pd.to_numeric, errors="coerce")
+            corr = num_df.corr(numeric_only=True)
+            if metric_col in corr.columns:
+                corr_series = corr[metric_col].drop(metric_col, errors="ignore").dropna()
+                if not corr_series.empty:
+                    top_feature = corr_series.abs().sort_values(ascending=False).index[0]
+                    corr_val = corr.loc[top_feature, metric_col]
+                    evidence = num_df[[metric_col, top_feature]].dropna().head(10)
+                    answer = f"The strongest numeric relationship with {metric_col} is {top_feature}, with correlation {corr_val:.2f}."
+                    return answer, evidence, 80
+
+    if qtype == "risk":
+        outlier_risks = detect_outlier_risk(df, safe_numeric_cols)
+        if outlier_risks:
+            top = outlier_risks[0]
+            evidence = retrieve_evidence_rows(df, top["column"], None, None, top_n=5)
+            answer = f"The biggest statistical risk is outlier concentration in {top['column']} at {top['outlier_pct']}%."
+            return answer, evidence, 78
+
+    evidence = df.head(5)
+    answer = f"The current filtered dataset has {len(df):,} rows and the primary metric is {metric_col}, totaling {pd.to_numeric(df[metric_col], errors='coerce').fillna(0).sum():,.2f}."
+    return answer, evidence, 65
 
 
-def insight_keywords(text: str) -> set:
-    stopwords = {
-        "the", "a", "an", "and", "or", "to", "of", "in", "for", "by", "with", "is", "are", "was", "were",
-        "this", "that", "from", "on", "as", "it", "be", "at", "into", "across", "than", "may", "can", "should"
+# =========================================================
+# DEMO DATA
+# =========================================================
+def make_demo_sales_dataset() -> pd.DataFrame:
+    np.random.seed(42)
+    dates = pd.date_range("2009-12-01", "2010-12-09", freq="H")
+    n = min(99263, len(dates))
+
+    countries = ["United Kingdom", "Ireland", "Netherlands", "Germany", "France", "Sweden", "Denmark", "Spain", "Switzerland", "Australia", "Nigeria"]
+    probs = np.array([0.47, 0.13, 0.10, 0.08, 0.06, 0.03, 0.03, 0.03, 0.03, 0.02, 0.02])
+
+    selected = np.random.choice(countries, size=n, p=probs)
+    qty = np.random.poisson(2.5, n) + 1
+    unit_price = np.round(np.random.gamma(2.0, 4.0, n), 2)
+    sales = np.round(qty * unit_price, 2)
+
+    sales[selected == "United Kingdom"] *= 1.8
+    sales[selected == "Nigeria"] *= 0.45
+
+    country_code_map = {
+        "United Kingdom": "GBR", "Ireland": "IRL", "Netherlands": "NLD", "Germany": "DEU",
+        "France": "FRA", "Sweden": "SWE", "Denmark": "DNK", "Spain": "ESP",
+        "Switzerland": "CHE", "Australia": "AUS", "Nigeria": "NGA"
     }
-    cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
-    tokens = {tok for tok in cleaned.split() if len(tok) > 2 and tok not in stopwords}
-    return tokens
+
+    df = pd.DataFrame({
+        "order_datetime": dates[:n],
+        "country": selected,
+        "country_code": [country_code_map[c] for c in selected],
+        "customer_id": np.random.randint(12000, 18000, n),
+        "product_id": np.random.randint(21000, 99999, n).astype(str),
+        "unit_price_gbp": unit_price,
+        "quantity_sold": qty,
+        "sales_amount_gbp": sales
+    })
+
+    df["population_total"] = df["country"].map({
+        "United Kingdom": 67e6, "Ireland": 5e6, "Netherlands": 17e6, "Germany": 83e6,
+        "France": 65e6, "Sweden": 10e6, "Denmark": 5.8e6, "Spain": 47e6,
+        "Switzerland": 8.7e6, "Australia": 25e6, "Nigeria": 206e6
+    })
+    df["gdp_current_usd"] = df["country"].map({
+        "United Kingdom": 3.1e12, "Ireland": 5e11, "Netherlands": 1e12, "Germany": 4.3e12,
+        "France": 3e12, "Sweden": 6e11, "Denmark": 4e11, "Spain": 1.4e12,
+        "Switzerland": 8e11, "Australia": 1.7e12, "Nigeria": 4.3e11
+    })
+    df["gdp_growth_pct"] = np.round(np.random.normal(2.2, 1.2, n), 2)
+    df["inflation_consumer_pct"] = np.round(np.random.normal(2.8, 1.0, n), 2)
+
+    df = add_time_features(df, "order_datetime")
+
+    dup_rows = df.sample(255, random_state=7)
+    df = pd.concat([df, dup_rows], ignore_index=True)
+    df = df.sample(frac=1, random_state=11).reset_index(drop=True)
+
+    return df
 
 
-def score_insight(insight: str, primary_metric: Optional[str], peer_insights: List[str], cat_cols: List[str], dt_cols: List[str]) -> Dict[str, float]:
-    text = insight.lower()
-
-    relevance = 45.0
-    if primary_metric and primary_metric.lower() in text:
-        relevance += 30
-    if any(col.lower() in text for col in cat_cols[:3]):
-        relevance += 10
-    if any(col.lower() in text for col in dt_cols[:2]):
-        relevance += 10
-    relevance = min(relevance, 100)
-
-    actionability = 35.0
-    if any(word in text for word in ["recommend", "investigate", "review", "prioritize", "focus", "protect", "improve"]):
-        actionability += 45
-    if any(word in text for word in ["risk", "decline", "drop", "weak", "underperformance"]):
-        actionability += 10
-    actionability = min(actionability, 100)
-
-    clarity = 40.0
-    word_count = len(insight.split())
-    if 12 <= word_count <= 32:
-        clarity += 30
-    if "." in insight or "," in insight:
-        clarity += 10
-    if any(word in text for word in ["because", "suggests", "indicates", "appears"]):
-        clarity += 15
-    clarity = min(clarity, 100)
-
-    current_keywords = insight_keywords(insight)
-    consistency_values = []
-    for peer in peer_insights:
-        peer_keywords = insight_keywords(peer)
-        union = current_keywords | peer_keywords
-        if not union:
-            continue
-        overlap = len(current_keywords & peer_keywords) / len(union)
-        consistency_values.append(overlap)
-    consistency = (float(np.mean(consistency_values)) * 100) if consistency_values else 40.0
-
-    total = round(relevance * 0.4 + actionability * 0.3 + consistency * 0.2 + clarity * 0.1, 1)
-    return {
-        "relevance": round(relevance, 1),
-        "actionability": round(actionability, 1),
-        "consistency": round(consistency, 1),
-        "clarity": round(clarity, 1),
-        "total": total,
-    }
+def load_uploaded_file(uploaded_file) -> pd.DataFrame:
+    if uploaded_file.name.lower().endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    if uploaded_file.name.lower().endswith((".xlsx", ".xls")):
+        return pd.read_excel(uploaded_file)
+    raise ValueError("Unsupported file format")
 
 
-def generate_rule_based_insights(df: pd.DataFrame, primary_metric: Optional[str], cat_cols: List[str], dt_cols: List[str]) -> List[str]:
-    insights = []
+# =========================================================
+# SIDEBAR
+# =========================================================
+with st.sidebar:
+    st.header("Data Input")
 
-    missing_cells = int(df.isna().sum().sum())
-    duplicates = int(df.duplicated().sum())
-    if missing_cells > 0:
-        insights.append(f"Data quality risk detected: the dataset contains {missing_cells:,} missing values that may affect reporting accuracy.")
-    if duplicates > 0:
-        insights.append(f"Duplicate record risk detected: {duplicates:,} duplicate rows should be reviewed before external reporting.")
-
-    if primary_metric and cat_cols:
-        best_col, best_cat, best_val = top_category_by_metric(df, cat_cols, primary_metric)
-        worst_col, worst_cat, worst_val = worst_category_by_metric(df, cat_cols, primary_metric)
-        if best_col and best_cat is not None:
-            insights.append(f"The strongest driver of {primary_metric} is {best_cat} within {best_col}, contributing {best_val:,.2f} overall.")
-        if worst_col and worst_cat is not None:
-            insights.append(f"Underperformance appears in {worst_cat} under {worst_col}, making it a priority area for review.")
-
-    if primary_metric and dt_cols:
-        trend = calculate_metric_trend(df, primary_metric, dt_cols[0])
-        if trend["pct_change"] is not None:
-            direction_word = "improved" if trend["pct_change"] >= 0 else "declined"
-            insights.append(f"Over time, {primary_metric} has {direction_word} by {abs(trend['pct_change']):.1f}% from the first month to the latest month.")
-
-    return insights[:4]
-
-
-def generate_statistical_insights(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str], dt_cols: List[str], primary_metric: Optional[str]) -> List[str]:
-    insights = []
-
-    corr = get_strongest_correlation(df, numeric_cols)
-    if corr:
-        a, b, val = corr
-        relation = "positive" if val >= 0 else "negative"
-        insights.append(f"The strongest statistical relationship is a {relation} correlation of {val:.2f} between {a} and {b}.")
-
-    outlier_signal = get_outlier_signal(df, numeric_cols)
-    if outlier_signal:
-        col, rate = outlier_signal
-        insights.append(f"Outlier analysis shows that {col} has the highest anomaly concentration at {rate:.1%}, which may distort averages and trends.")
-
-    if primary_metric and dt_cols:
-        trend = calculate_metric_trend(df, primary_metric, dt_cols[0])
-        monthly = trend.get("monthly")
-        if monthly is not None and len(monthly) >= 3:
-            recent = monthly.tail(3).values
-            if len(recent) == 3:
-                slope = recent[-1] - recent[0]
-                direction = "upward" if slope >= 0 else "downward"
-                insights.append(f"Recent monthly movement for {primary_metric} shows a {direction} direction across the latest observed periods.")
-
-    if cat_cols and primary_metric:
-        grouped = df.groupby(cat_cols[0], dropna=False)[primary_metric].sum(numeric_only=True)
-        if not grouped.empty:
-            spread = grouped.max() - grouped.min()
-            insights.append(f"Category spread analysis indicates a {spread:,.2f} gap between the strongest and weakest values in {cat_cols[0]}." )
-
-    return insights[:4]
-
-
-def generate_narrative_insights(df: pd.DataFrame, primary_metric: Optional[str], cat_cols: List[str], dt_cols: List[str], quality_score: int) -> List[str]:
-    insights = []
-
-    if primary_metric and dt_cols:
-        trend = calculate_metric_trend(df, primary_metric, dt_cols[0])
-        if trend["pct_change"] is not None:
-            if trend["pct_change"] >= 0:
-                insights.append(f"Narrative assessment suggests momentum is favorable because {primary_metric} is trending upward over time, which may indicate healthy commercial performance.")
-            else:
-                insights.append(f"Narrative assessment suggests caution because {primary_metric} is trending downward over time, which may reflect weakening demand, execution gaps, or retention issues.")
-
-    if cat_cols and primary_metric:
-        best_col, best_cat, _ = top_category_by_metric(df, cat_cols, primary_metric)
-        worst_col, worst_cat, _ = worst_category_by_metric(df, cat_cols, primary_metric)
-        if best_col and best_cat:
-            insights.append(f"From a business perspective, {best_cat} in {best_col} appears to be a dependable growth segment that should be protected and scaled.")
-        if worst_col and worst_cat:
-            insights.append(f"The weakest segment appears to be {worst_cat} in {worst_col}, suggesting a need for targeted investigation and intervention.")
-
-    if quality_score < 75:
-        insights.append(f"Decision confidence should be moderated because the current data quality score is {quality_score}/100, indicating reporting and interpretation risk.")
-    else:
-        insights.append(f"Decision confidence is relatively strong because the data quality score is {quality_score}/100, supporting more reliable interpretation.")
-
-    return insights[:4]
-
-
-def build_evaluation_table(engine_outputs: Dict[str, List[str]], primary_metric: Optional[str], cat_cols: List[str], dt_cols: List[str]) -> pd.DataFrame:
-    rows = []
-    all_entries = []
-    for engine, insights in engine_outputs.items():
-        for insight in insights:
-            all_entries.append((engine, insight))
-
-    for engine, insight in all_entries:
-        peer_texts = [text for e, text in all_entries if text != insight]
-        scores = score_insight(insight, primary_metric, peer_texts, cat_cols, dt_cols)
-        rows.append(
-            {
-                "Engine": engine,
-                "Insight Type": classify_insight(insight).title(),
-                "Insight": insight,
-                "Relevance": scores["relevance"],
-                "Actionability": scores["actionability"],
-                "Consistency": scores["consistency"],
-                "Clarity": scores["clarity"],
-                "Total Score": scores["total"],
-                "Agreement": agreement_label(scores["consistency"]),
-            }
-        )
-
-    result = pd.DataFrame(rows)
-    if not result.empty:
-        result = result.sort_values(["Total Score", "Engine"], ascending=[False, True]).reset_index(drop=True)
-    return result
-
-
-def generate_executive_summary(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str], dt_cols: List[str]) -> str:
-    if df.empty:
-        return "No data is available to generate an executive summary."
-
-    metric = get_primary_metric(numeric_cols)
-    date_col = get_primary_datetime(dt_cols)
-
-    summary_parts = []
-    summary_parts.append(
-        f"The dataset contains {len(df):,} records across {df.shape[1]} columns, providing a broad view of the uploaded business data."
+    input_mode = st.radio(
+        "Choose input mode",
+        ["Upload your own file", "Use demo sales dataset"],
+        index=0
     )
 
-    if metric:
-        metric_total = pd.to_numeric(df[metric], errors="coerce").sum()
-        summary_parts.append(f"The primary business metric appears to be **{metric}**, with a total value of **{metric_total:,.2f}**.")
+    st.subheader("Upload CSV or Excel")
+    uploaded_file = st.file_uploader(
+        "Drag and drop file here",
+        type=["csv", "xlsx", "xls"],
+        label_visibility="collapsed"
+    )
 
-    if date_col and metric:
-        trend = calculate_metric_trend(df, metric, date_col)
-        if trend["pct_change"] is not None:
-            trend_word = "improved" if trend["pct_change"] >= 0 else "declined"
-            summary_parts.append(
-                f"Over time, **{metric}** has **{trend_word} by {abs(trend['pct_change']):.1f}%** from the first observed month to the latest one."
-            )
-
-    if cat_cols and metric:
-        best_col, best_cat, best_val = top_category_by_metric(df, cat_cols, metric)
-        worst_col, worst_cat, _ = worst_category_by_metric(df, cat_cols, metric)
-        if best_col and best_cat is not None:
-            summary_parts.append(
-                f"The strongest contribution comes from **{best_cat}** in **{best_col}**, contributing **{best_val:,.2f}** to {metric}."
-            )
-        if worst_col and worst_cat is not None:
-            summary_parts.append(
-                f"The weakest contribution appears in **{worst_cat}** under **{worst_col}**, which should be reviewed for underperformance or data issues."
-            )
-
-    missing_cells = int(df.isna().sum().sum())
-    duplicates = int(df.duplicated().sum())
-    if missing_cells > 0 or duplicates > 0:
-        summary_parts.append(
-            f"From a data quality perspective, the file contains **{missing_cells:,} missing values** and **{duplicates:,} duplicate rows**, which may affect downstream interpretation."
-        )
-
-    return " ".join(summary_parts)
-
-
-def compute_risk_alerts(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str]) -> List[Tuple[str, str]]:
-    alerts: List[Tuple[str, str]] = []
-
-    missing_ratio = df.isna().sum().sum() / (df.shape[0] * df.shape[1]) if df.shape[0] and df.shape[1] else 0
-    if missing_ratio > 0.1:
-        alerts.append(("high", f"High missing-data risk detected: {missing_ratio:.1%} of all cells are missing."))
-    elif missing_ratio > 0.03:
-        alerts.append(("medium", f"Moderate missing-data risk detected: {missing_ratio:.1%} of all cells are missing."))
-
-    duplicate_count = int(df.duplicated().sum())
-    if duplicate_count > 0:
-        level = "high" if duplicate_count / max(len(df), 1) > 0.05 else "medium"
-        alerts.append((level, f"Duplicate-record risk detected: {duplicate_count:,} duplicate rows found."))
-
-    for col in numeric_cols[:4]:
-        series = df[col].dropna()
-        if len(series) < 8:
-            continue
-        q1, q3 = series.quantile([0.25, 0.75])
-        iqr = q3 - q1
-        if iqr == 0:
-            continue
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        outlier_rate = ((series < lower) | (series > upper)).mean()
-        if outlier_rate > 0.08:
-            alerts.append(("medium", f"Outlier concentration in **{col}** is elevated at {outlier_rate:.1%}."))
-
-    for col in cat_cols[:4]:
-        value_share = df[col].astype(str).value_counts(normalize=True, dropna=False)
-        if not value_share.empty and value_share.iloc[0] > 0.75:
-            alerts.append(("low", f"Category imbalance found in **{col}**: one value accounts for {value_share.iloc[0]:.1%} of rows."))
-
-    if not alerts:
-        alerts.append(("low", "No major structural data risks were detected in the uploaded dataset."))
-
-    return alerts[:6]
-
-
-def generate_recommendations(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str], dt_cols: List[str]) -> List[str]:
-    recs: List[str] = []
-    metric = get_primary_metric(numeric_cols)
-
-    if df.isna().sum().sum() > 0:
-        recs.append("Prioritize data cleanup before decision-making, especially in fields with missing values that influence revenue, sales, or performance reporting.")
-
-    if int(df.duplicated().sum()) > 0:
-        recs.append("Remove duplicate records before presenting insights externally, as duplicates can overstate totals and distort business conclusions.")
-
-    if cat_cols and metric:
-        best_col, best_cat, _ = top_category_by_metric(df, cat_cols, metric)
-        worst_col, worst_cat, _ = worst_category_by_metric(df, cat_cols, metric)
-        if best_col and best_cat:
-            recs.append(f"Protect and replicate the strongest-performing segment: **{best_cat}** in **{best_col}** appears to be a leading value driver.")
-        if worst_col and worst_cat:
-            recs.append(f"Investigate the weakest area: **{worst_cat}** in **{worst_col}** may need operational, pricing, or retention review.")
-
-    if dt_cols and metric:
-        recs.append("Track the primary KPI over time using monthly trend reviews so sudden drops or unusual spikes are identified earlier.")
-
-    if len(numeric_cols) >= 2:
-        corr = df[numeric_cols].corr(numeric_only=True)
-        if not corr.empty:
-            corr_vals = corr.where(~np.eye(corr.shape[0], dtype=bool)).stack().sort_values(key=lambda s: s.abs(), ascending=False)
-            if not corr_vals.empty:
-                a, b = corr_vals.index[0]
-                val = corr_vals.iloc[0]
-                recs.append(f"Review the relationship between **{a}** and **{b}** (correlation {val:.2f}) to identify controllable drivers of performance.")
-
-    if not recs:
-        recs.append("The dataset appears structurally stable. Focus next on defining business-specific KPIs and adding decision rules for action prioritization.")
-
-    return recs[:5]
-
-
-def choose_chart(df: pd.DataFrame, numeric_cols: List[str], cat_cols: List[str], dt_cols: List[str]):
-    metric = get_primary_metric(numeric_cols)
-    date_col = get_primary_datetime(dt_cols)
-
-    if date_col and metric:
-        temp = df[[date_col, metric]].dropna().copy()
-        temp = temp.sort_values(date_col)
-        if not temp.empty:
-            fig = px.line(temp, x=date_col, y=metric, title=f"{metric} over time")
-            return fig, f"Recommended chart: line chart because **{date_col}** is a time field and **{metric}** is numeric."
-
-    if cat_cols and metric:
-        col = cat_cols[0]
-        grouped = df.groupby(col, dropna=False)[metric].sum(numeric_only=True).reset_index()
-        grouped = grouped.sort_values(metric, ascending=False).head(10)
-        fig = px.bar(grouped, x=col, y=metric, title=f"Top {col} by {metric}")
-        return fig, f"Recommended chart: bar chart because **{col}** is categorical and **{metric}** is numeric."
-
-    if len(numeric_cols) >= 2:
-        x_col, y_col = numeric_cols[:2]
-        fig = px.scatter(df, x=x_col, y=y_col, title=f"{y_col} vs {x_col}")
-        return fig, f"Recommended chart: scatter plot because both **{x_col}** and **{y_col}** are numeric."
-
-    if numeric_cols:
-        metric = numeric_cols[0]
-        fig = px.histogram(df, x=metric, nbins=30, title=f"Distribution of {metric}")
-        return fig, f"Recommended chart: histogram because **{metric}** is numeric and no strong grouping field was detected."
-
-    return None, "No recommended chart could be generated because no suitable numeric field was found."
-
-
-def make_download_report(summary: str, risks: List[Tuple[str, str]], recs: List[str], quality_score: int, evaluation_df: pd.DataFrame) -> pd.DataFrame:
-    rows = [
-        {"Section": "Executive Summary", "Detail": summary},
-        {"Section": "Data Quality Score", "Detail": quality_score},
-    ]
-    for level, msg in risks:
-        rows.append({"Section": f"Risk Alert ({level.title()})", "Detail": msg})
-    for idx, rec in enumerate(recs, start=1):
-        rows.append({"Section": f"Recommendation {idx}", "Detail": rec})
-    if not evaluation_df.empty:
-        top = evaluation_df.iloc[0]
-        rows.append({"Section": "Top Insight Engine", "Detail": f"{top['Engine']} with score {top['Total Score']}"})
-    return pd.DataFrame(rows)
-
-
-def render_risk_box(level: str, message: str) -> None:
-    css_class = {
-        "high": "risk-high",
-        "medium": "risk-medium",
-        "low": "risk-low",
-    }.get(level, "risk-low")
-    st.markdown(f'<div class="risk-box {css_class}">{message}</div>', unsafe_allow_html=True)
-
-
-# =========================
-# Header
-# =========================
-st.markdown('<div class="main-title">Client Intelligence Platform</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitle">Upload a CSV/XLSX file or try demo mode to generate KPI dashboards, trend analysis, anomaly detection, recommendations, and multi-engine insight evaluation.</div>',
-    unsafe_allow_html=True,
-)
-
-intro1, intro2, intro3, intro4 = st.columns(4)
-intro1.info("**Business Problem**
-Teams often receive raw data with little clarity on what matters most.")
-intro2.info("**What this platform does**
-Converts raw data into summaries, KPIs, charts, risks, and actions.")
-intro3.info("**Research Upgrade**
-Compares rule-based, statistical, and narrative insight engines side by side.")
-intro4.info("**How to use it**
-Upload a file or choose demo mode, then filter and review insights.")
-
-st.markdown("---")
-
-
-# =========================
-# Sidebar controls
-# =========================
-st.sidebar.header("Data Input")
-input_mode = st.sidebar.radio(
-    "Choose input mode",
-    ["Upload your own file", "Use demo sales dataset"],
-)
-
-sample_df = create_sample_sales_data()
-
-if input_mode == "Upload your own file":
-    uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
-    st.sidebar.download_button(
+    demo_csv = to_csv_download(make_demo_sales_dataset())
+    st.download_button(
         "Download sample sales dataset",
-        data=dataframe_to_csv_bytes(sample_df),
-        file_name="sample_sales_data.csv",
-        mime="text/csv",
+        data=demo_csv,
+        file_name="sample_sales_dataset.csv",
+        mime="text/csv"
     )
-    if uploaded_file is None:
-        st.info("Upload a CSV or Excel file to begin analysis, or switch to demo mode from the sidebar.")
-        st.stop()
-    raw_df = load_uploaded_file(uploaded_file)
-else:
-    raw_df = sample_df.copy()
-    st.sidebar.success("Demo mode enabled with a built-in sales dataset.")
 
 
-df = coerce_datetimes(raw_df)
-numeric_cols, categorical_cols, datetime_cols, identifier_cols = infer_column_types(df)
-primary_metric = get_primary_metric(numeric_cols)
-primary_date = get_primary_datetime(datetime_cols)
+# =========================================================
+# LOAD DATA
+# =========================================================
+df_raw = None
 
+try:
+    if input_mode == "Use demo sales dataset":
+        df_raw = make_demo_sales_dataset()
+    elif uploaded_file is not None:
+        df_raw = load_uploaded_file(uploaded_file)
+except Exception as e:
+    st.error(f"Failed to load file: {e}")
+    st.stop()
 
-# =========================
-# Filters
-# =========================
-st.sidebar.header("Filters")
-filtered_df = df.copy()
+if df_raw is None:
+    st.title("Client Intelligence Platform")
+    st.markdown("Upload a CSV/XLSX file or use demo mode.")
+    st.stop()
 
-if primary_date and primary_date in filtered_df.columns:
-    min_date = filtered_df[primary_date].dropna().min()
-    max_date = filtered_df[primary_date].dropna().max()
-    if pd.notna(min_date) and pd.notna(max_date):
-        selected_dates = st.sidebar.date_input(
-            "Date range",
-            value=(min_date.date(), max_date.date()),
-            min_value=min_date.date(),
-            max_value=max_date.date(),
-        )
-        if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
-            start_date, end_date = selected_dates
-            filtered_df = filtered_df[
-                filtered_df[primary_date].between(pd.to_datetime(start_date), pd.to_datetime(end_date))
-            ]
+df = df_raw.copy()
+df.columns = [str(c).strip() for c in df.columns]
 
-for col in categorical_cols[:3]:
-    options = filtered_df[col].dropna().astype(str).unique().tolist()
-    if 1 < len(options) <= 30:
-        selected = st.sidebar.multiselect(f"Filter {col}", options=sorted(options))
-        if selected:
-            filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected)]
+date_col = infer_date_column(df)
+df = add_time_features(df, date_col)
+numeric_cols = infer_numeric_columns(df)
+date_col = infer_date_column(df)
+categorical_cols = infer_categorical_columns(df, numeric_cols, date_col)
+primary_metric = infer_primary_metric(df, numeric_cols)
 
-if filtered_df.empty:
-    st.warning("No data remains after applying filters. Please relax one or more filters.")
+if primary_metric is None:
+    st.error("No usable numeric primary metric found.")
     st.stop()
 
 
-# =========================
-# KPI metrics
-# =========================
+# =========================================================
+# FILTERS
+# =========================================================
+filtered_df = df.copy()
+
+with st.sidebar:
+    st.header("Filters")
+
+    if date_col and date_col in filtered_df.columns:
+        try:
+            filtered_df[date_col] = pd.to_datetime(filtered_df[date_col], errors="coerce")
+            min_date = filtered_df[date_col].min()
+            max_date = filtered_df[date_col].max()
+
+            if pd.notna(min_date) and pd.notna(max_date):
+                date_range = st.date_input("Date range", (min_date.date(), max_date.date()))
+                if isinstance(date_range, tuple) and len(date_range) == 2:
+                    start_date, end_date = date_range
+                    filtered_df = filtered_df[
+                        (filtered_df[date_col].dt.date >= start_date) &
+                        (filtered_df[date_col].dt.date <= end_date)
+                    ]
+        except Exception:
+            pass
+
+    for col in categorical_cols[:5]:
+        try:
+            values = sorted([str(v) for v in filtered_df[col].dropna().unique()])
+            if 1 < len(values) <= 50:
+                chosen = st.multiselect(f"Filter {col}", values, default=[])
+                if chosen:
+                    filtered_df = filtered_df[filtered_df[col].astype(str).isin(chosen)]
+        except Exception:
+            continue
+
+if filtered_df.empty:
+    st.error("No rows left after filtering.")
+    st.stop()
+
+
+# =========================================================
+# RE-COMPUTE AFTER FILTERING
+# =========================================================
+safe_numeric_cols = get_safe_numeric_columns(filtered_df, numeric_cols)
+if primary_metric not in safe_numeric_cols and primary_metric in filtered_df.columns:
+    safe_numeric_cols.append(primary_metric)
+
 quality_score = compute_data_quality_score(filtered_df)
-missing_count = int(filtered_df.isna().sum().sum())
+rows = len(filtered_df)
+cols = len(filtered_df.columns)
+missing_values = int(filtered_df.isna().sum().sum())
 duplicate_count = int(filtered_df.duplicated().sum())
 
-metric1, metric2, metric3, metric4, metric5 = st.columns(5)
-metric1.metric("Rows", f"{len(filtered_df):,}")
-metric2.metric("Columns", filtered_df.shape[1])
-metric3.metric("Missing Values", f"{missing_count:,}")
-metric4.metric("Duplicates", f"{duplicate_count:,}")
-metric5.metric("Data Quality Score", f"{quality_score}/100")
+metric_series = pd.to_numeric(filtered_df[primary_metric], errors="coerce").fillna(0)
+total_metric = metric_series.sum()
+avg_metric = metric_series.mean()
 
-if primary_metric and primary_metric in filtered_df.columns:
-    extra1, extra2, extra3 = st.columns(3)
-    total_metric = pd.to_numeric(filtered_df[primary_metric], errors="coerce").sum()
-    mean_metric = pd.to_numeric(filtered_df[primary_metric], errors="coerce").mean()
-    extra1.metric(f"Total {primary_metric}", f"{total_metric:,.2f}")
-    extra2.metric(f"Average {primary_metric}", f"{mean_metric:,.2f}")
-
-    best_col, best_cat, best_val = top_category_by_metric(filtered_df, categorical_cols, primary_metric)
-    if best_col and best_cat is not None:
-        extra3.metric("Best Segment", f"{best_cat}", help=f"Top value from {best_col}: {best_val:,.2f}")
-
-st.markdown("---")
+best_dim, best_entity, best_value = detect_best_dimension(filtered_df, primary_metric, categorical_cols)
+weak_dim, weak_entity, weak_value = detect_weakest_dimension(filtered_df, primary_metric, categorical_cols)
+trend_stats = month_trend_stats(filtered_df, date_col, primary_metric)
+outlier_risks = detect_outlier_risk(filtered_df, safe_numeric_cols)
+imbalance_alerts = detect_category_imbalance(filtered_df, categorical_cols)
 
 
-# =========================
-# Executive summary / risks / recommendations
-# =========================
-summary = generate_executive_summary(filtered_df, numeric_cols, categorical_cols, datetime_cols)
-risks = compute_risk_alerts(filtered_df, numeric_cols, categorical_cols)
-recommendations = generate_recommendations(filtered_df, numeric_cols, categorical_cols, datetime_cols)
+# =========================================================
+# HEADER + KPI
+# =========================================================
+st.title("Client Intelligence Platform")
+st.markdown(
+    "Upload a CSV/XLSX file or try demo mode to generate KPI dashboards, trend analysis, anomaly detection, recommendations, multi-engine insight evaluation, retrieval-backed evidence, and agent-style Q&A."
+)
 
-left, right = st.columns([1.5, 1])
+info_cols = st.columns(4)
+with info_cols[0]:
+    st.info("**Business Problem** Teams often receive raw data with little clarity on what matters most.")
+with info_cols[1]:
+    st.info("**What this platform does** Converts raw data into summaries, KPIs, charts, risks, and actions.")
+with info_cols[2]:
+    st.info("**Perplexity-style upgrade** Retrieval-backed evidence, source snippets, benchmark scoring, and agent Q&A.")
+with info_cols[3]:
+    st.info("**How to use it** Upload data, filter it, review insights, inspect evidence, and ask grounded questions.")
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Rows", f"{rows:,}")
+k2.metric("Columns", cols)
+k3.metric("Missing Values", missing_values)
+k4.metric("Duplicates", duplicate_count)
+k5.metric("Data Quality Score", f"{quality_score}/100")
+
+k6, k7, k8 = st.columns(3)
+k6.metric(f"Total {primary_metric}", f"{total_metric:,.2f}")
+k7.metric(f"Average {primary_metric}", f"{avg_metric:,.2f}")
+k8.metric("Best Segment", best_entity if best_entity else "N/A")
+
+
+# =========================================================
+# SUMMARY + RISKS
+# =========================================================
+left, right = st.columns([2, 1])
 
 with left:
     st.subheader("Executive Summary")
-    st.markdown(f'<div class="section-card">{summary}</div>', unsafe_allow_html=True)
+
+    parts = [
+        f"The dataset contains {rows:,} records across {cols} columns.",
+        f"The primary business metric appears to be **{primary_metric}**, with a total value of **{total_metric:,.2f}**."
+    ]
+
+    if trend_stats["pct_change"] is not None:
+        if trend_stats["pct_change"] > 0:
+            parts.append(f"Over time, **{primary_metric}** has **improved by {abs(trend_stats['pct_change']):.1f}%** from the first observed month to the latest one.")
+        else:
+            parts.append(f"Over time, **{primary_metric}** has **declined by {abs(trend_stats['pct_change']):.1f}%** from the first observed month to the latest one.")
+
+    if best_dim and best_entity:
+        parts.append(f"The strongest contribution comes from **{best_entity}** in **{best_dim}**, contributing **{best_value:,.2f}**.")
+    if weak_dim and weak_entity:
+        parts.append(f"The weakest contribution appears in **{weak_entity}** under **{weak_dim}**.")
+    parts.append(f"From a data quality perspective, the file contains **{missing_values} missing values** and **{duplicate_count} duplicate rows**.")
+
+    st.markdown(f"<div class='card'>{' '.join(parts)}</div>", unsafe_allow_html=True)
 
 with right:
     st.subheader("Risk Alerts")
-    for level, message in risks:
-        render_risk_box(level, message)
 
+    if duplicate_count > 0:
+        st.warning(f"Duplicate-record risk detected: {duplicate_count} duplicate rows found.")
+
+    for item in outlier_risks[:3]:
+        st.info(f"Outlier concentration in **{item['column']}** is elevated at {item['outlier_pct']}%.")
+
+    for item in imbalance_alerts[:3]:
+        st.info(f"Category imbalance found in **{item['column']}**: one value accounts for {item['top_share']}% of rows.")
+
+
+# =========================================================
+# RECOMMENDATIONS
+# =========================================================
 st.subheader("Recommendations")
-for i, rec in enumerate(recommendations, start=1):
+recs = []
+
+if duplicate_count > 0:
+    recs.append("Remove duplicate records before external reporting, as duplicates can distort totals and conclusions.")
+if best_dim and best_entity:
+    recs.append(f"Protect and replicate the strongest-performing segment: **{best_entity} in {best_dim}**.")
+if weak_dim and weak_entity:
+    recs.append(f"Investigate the weakest area: **{weak_entity} in {weak_dim}** may need operational or retention review.")
+if trend_stats["pct_change"] is not None:
+    recs.append("Track the primary KPI monthly so sudden drops or unusual spikes are detected earlier.")
+
+try:
+    if primary_metric in safe_numeric_cols:
+        corr_df = filtered_df[safe_numeric_cols].apply(pd.to_numeric, errors="coerce")
+        corr_series = corr_df.corr(numeric_only=True)[primary_metric].drop(primary_metric, errors="ignore").dropna()
+        if not corr_series.empty:
+            top_driver = corr_series.abs().sort_values(ascending=False).index[0]
+            top_corr = corr_df.corr(numeric_only=True).loc[top_driver, primary_metric]
+            recs.append(f"Review the relationship between **{top_driver}** and **{primary_metric}** (correlation {top_corr:.2f}) to identify controllable drivers.")
+except Exception:
+    pass
+
+for i, rec in enumerate(recs[:5], start=1):
     st.markdown(f"**{i}.** {rec}")
 
-st.markdown("---")
+
+# =========================================================
+# ENGINES
+# =========================================================
+rule_based_insights = build_rule_based_insights(filtered_df, primary_metric, date_col, categorical_cols)
+statistical_insights = build_statistical_insights(filtered_df, primary_metric, date_col, safe_numeric_cols, categorical_cols)
+narrative_insights = build_narrative_insights(filtered_df, primary_metric, date_col, categorical_cols, quality_score)
+
+dataset_context = build_dataset_context(filtered_df, primary_metric, date_col, categorical_cols, safe_numeric_cols)
+gemini_result = run_gemini_engine(dataset_context)
+gemini_status = gemini_result["status"]
+gemini_error = gemini_result["error"]
+gemini_insights = gemini_result["insights"]
+
+if gemini_status != "ok" or not gemini_insights:
+    gemini_insights = [{
+        "engine": "Gemini LLM Engine",
+        "title": "Gemini unavailable",
+        "statement": "Gemini was unavailable in this run, so final ranking should be interpreted without successful LLM validation.",
+        "insight_type": "general",
+        "metric": primary_metric,
+        "dimension": None,
+        "entity": None,
+        "direction": "none",
+        "evidence": "Fallback applied because Gemini did not return valid structured output.",
+        "base_confidence": 35
+    }]
+
+all_engine_insights = rule_based_insights + statistical_insights + narrative_insights + gemini_insights
 
 
-# =========================
-# Evaluation layer
-# =========================
+# =========================================================
+# EVIDENCE RETRIEVAL + SOURCE SNIPPETS
+# =========================================================
+evidence_map = {}
+
+for insight in all_engine_insights:
+    if not insight.get("evidence"):
+        insight["evidence"] = build_evidence_text(insight, filtered_df, primary_metric)
+
+    evidence_rows = retrieve_evidence_rows(
+        filtered_df,
+        metric_col=primary_metric if insight.get("metric") is None else insight.get("metric"),
+        dimension=insight.get("dimension"),
+        entity=insight.get("entity"),
+        top_n=5
+    )
+
+    evidence_key = insight["engine"] + "||" + insight["statement"]
+    evidence_map[evidence_key] = evidence_rows
+
+    score_insight(insight, evidence_rows, gemini_status)
+
+
+# =========================================================
+# INSIGHT EVALUATION LAYER
+# =========================================================
 st.subheader("Insight Evaluation Layer")
-st.caption("This research-style section compares how different reasoning engines generate and score insights from the same dataset.")
+st.caption("This section compares how different reasoning engines generate and score insights from the same filtered dataset.")
 
-engine_outputs = {
-    "Rule-Based Engine": generate_rule_based_insights(filtered_df, primary_metric, categorical_cols, datetime_cols),
-    "Statistical Engine": generate_statistical_insights(filtered_df, numeric_cols, categorical_cols, datetime_cols, primary_metric),
-    "Narrative Engine": generate_narrative_insights(filtered_df, primary_metric, categorical_cols, datetime_cols, quality_score),
-}
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Rule-Based Engine",
+    "Statistical Engine",
+    "Narrative Engine",
+    "Gemini LLM Engine"
+])
 
-evaluation_df = build_evaluation_table(engine_outputs, primary_metric, categorical_cols, datetime_cols)
+def render_engine_tab(insights: List[Dict[str, Any]]):
+    for idx, insight in enumerate(insights, start=1):
+        st.markdown(f"**{idx}. {insight['statement']}**")
+        st.markdown(f"**Evidence:** {insight['evidence']}")
+        st.markdown(f"**Base confidence:** {insight['base_confidence']}")
+        key = insight["engine"] + "||" + insight["statement"]
+        rows_df = evidence_map.get(key, pd.DataFrame())
+        if rows_df is not None and not rows_df.empty:
+            with st.expander("View source snippets"):
+                st.dataframe(rows_df, use_container_width=True)
+        st.markdown("---")
 
-engine_tabs = st.tabs(list(engine_outputs.keys()))
-for tab, (engine_name, insights) in zip(engine_tabs, engine_outputs.items()):
-    with tab:
-        if insights:
-            for idx, insight in enumerate(insights, start=1):
-                st.markdown(f"**{idx}.** {insight}")
-        else:
-            st.info("This engine did not generate enough evidence-based insights for the current dataset.")
+with tab1:
+    render_engine_tab(rule_based_insights)
 
-st.markdown("### Comparison Table")
-st.dataframe(evaluation_df, width="stretch", hide_index=True)
+with tab2:
+    render_engine_tab(statistical_insights)
 
-if not evaluation_df.empty:
-    avg_scores = evaluation_df.groupby("Engine")["Total Score"].mean().reset_index()
-    avg_fig = px.bar(avg_scores, x="Engine", y="Total Score", title="Average Insight Score by Engine")
-    st.plotly_chart(avg_fig, width="stretch")
+with tab3:
+    render_engine_tab(narrative_insights)
 
-    top_engine = avg_scores.sort_values("Total Score", ascending=False).iloc[0]
-    st.success(f"Top-performing engine in the current run: **{top_engine['Engine']}** with an average score of **{top_engine['Total Score']:.1f}**.")
-
-st.markdown("---")
+with tab4:
+    if gemini_status == "ok":
+        render_engine_tab(gemini_insights)
+    else:
+        st.warning(f"Gemini unavailable in this run: {gemini_error}")
+        render_engine_tab(gemini_insights)
 
 
-# =========================
-# Recommended chart + additional visuals
-# =========================
-st.subheader("Recommended Visualization")
-recommended_fig, chart_reason = choose_chart(filtered_df, numeric_cols, categorical_cols, datetime_cols)
-st.caption(chart_reason)
-if recommended_fig is not None:
-    st.plotly_chart(recommended_fig, width="stretch")
+# =========================================================
+# BENCHMARK TABLE
+# =========================================================
+st.subheader("Benchmark Evaluation Table")
 
-viz_col1, viz_col2 = st.columns(2)
+benchmark_df = pd.DataFrame([
+    {
+        "Engine": x["engine"],
+        "Insight Type": x["insight_type"].title(),
+        "Insight": x["statement"],
+        "Relevance": x["relevance"],
+        "Actionability": x["actionability"],
+        "Consistency": x["consistency"],
+        "Clarity": x["clarity"],
+        "Grounding": x["grounding"],
+        "Evidence Coverage": x["evidence_coverage"],
+        "Base Confidence": x["base_confidence"],
+        "LLM Valid": x["llm_valid"],
+        "Final Score": x["final_score"]
+    }
+    for x in all_engine_insights
+]).sort_values(by="Final Score", ascending=False)
 
-with viz_col1:
-    if categorical_cols and primary_metric:
-        cat_col = categorical_cols[0]
-        grouped = (
-            filtered_df.groupby(cat_col, dropna=False)[primary_metric]
-            .sum(numeric_only=True)
-            .reset_index()
-            .sort_values(primary_metric, ascending=False)
-            .head(10)
+st.dataframe(benchmark_df, use_container_width=True, hide_index=True)
+
+
+# =========================================================
+# CONTRADICTIONS
+# =========================================================
+contradictions = detect_contradictions(all_engine_insights)
+
+if contradictions:
+    st.subheader("Contradiction Detection")
+    for item in contradictions:
+        st.error(
+            f"Potential contradiction:\n\n"
+            f"- {item['insight_a']['statement']}\n"
+            f"- {item['insight_b']['statement']}\n\n"
+            f"Reason: {item['reason']}"
         )
-        fig = px.bar(grouped, x=cat_col, y=primary_metric, title=f"Top {cat_col} by {primary_metric}")
-        st.plotly_chart(fig, width="stretch")
 
-with viz_col2:
-    if len(numeric_cols) >= 1:
-        hist_metric = primary_metric or numeric_cols[0]
-        fig = px.histogram(filtered_df, x=hist_metric, nbins=30, title=f"Distribution of {hist_metric}")
-        st.plotly_chart(fig, width="stretch")
 
-if len(numeric_cols) >= 2:
+# =========================================================
+# FINAL RELIABLE INSIGHTS
+# =========================================================
+final_reliable_insights = build_final_reliable_insights(all_engine_insights, contradictions)
+
+st.subheader("Grounded Final Verdict")
+for idx, insight in enumerate(final_reliable_insights, start=1):
+    st.markdown(f"**{idx}. {insight['statement']}**")
+    st.markdown(f"- **Engine:** {insight['engine']}")
+    st.markdown(f"- **Adjusted Final Score:** {insight['adjusted_final_score']}")
+    st.markdown(f"- **Evidence:** {insight['evidence']}")
+    key = insight["engine"] + "||" + insight["statement"]
+    rows_df = evidence_map.get(key, pd.DataFrame())
+    if rows_df is not None and not rows_df.empty:
+        with st.expander("Inspect evidence rows"):
+            st.dataframe(rows_df, use_container_width=True)
+    st.markdown("---")
+
+
+# =========================================================
+# ENGINE SCORE CHART
+# =========================================================
+engine_score_df = pd.DataFrame(all_engine_insights).groupby("engine", as_index=False)["final_score"].mean()
+engine_score_df.columns = ["Engine", "Final Score"]
+engine_score_df = engine_score_df.sort_values(by="Final Score", ascending=False)
+
+st.subheader("Average Insight Score by Engine")
+fig_engine = px.bar(engine_score_df, x="Engine", y="Final Score")
+st.plotly_chart(fig_engine, use_container_width=True)
+
+if not engine_score_df.empty:
+    top_engine = engine_score_df.iloc[0]["Engine"]
+    top_score = engine_score_df.iloc[0]["Final Score"]
+    st.success(f"Top-performing engine in the current run: **{top_engine}** with an average score of **{top_score:.1f}**.")
+
+
+# =========================================================
+# AGENT-STYLE Q&A
+# =========================================================
+st.subheader("Ask Your Data")
+question = st.text_input("Ask a grounded question about the current filtered dataset")
+
+if question:
+    rule_answer, rule_evidence, rule_conf = answer_question_with_rules(
+        question, filtered_df, primary_metric, date_col, categorical_cols, safe_numeric_cols
+    )
+
+    st.markdown(f"**Agent answer:** {rule_answer}")
+    st.markdown(f"**Confidence:** {rule_conf}")
+    if rule_evidence is not None and not rule_evidence.empty:
+        with st.expander("Supporting evidence rows"):
+            st.dataframe(rule_evidence, use_container_width=True)
+
+    ask_result = run_gemini_engine(dataset_context, question)
+    if ask_result["status"] == "ok" and ask_result["insights"]:
+        st.markdown("**Gemini grounded answer:**")
+        st.info(ask_result["insights"][0]["statement"])
+        st.caption(ask_result["insights"][0].get("evidence", "Grounded from current filtered dataset."))
+    else:
+        st.caption("Gemini grounded answer unavailable in this run.")
+
+
+# =========================================================
+# VISUALS
+# =========================================================
+st.subheader("Recommended Visualization")
+
+if date_col and primary_metric:
+    st.caption(f"Recommended chart: line chart because {date_col} is a time field and {primary_metric} is numeric.")
+    try:
+        temp = filtered_df.copy()
+        temp[date_col] = pd.to_datetime(temp[date_col], errors="coerce")
+        temp = temp.dropna(subset=[date_col])
+
+        if not temp.empty:
+            trend_df = temp.groupby(date_col, as_index=False)[primary_metric].sum().sort_values(by=date_col)
+            fig_trend = px.line(trend_df, x=date_col, y=primary_metric, title=f"{primary_metric} over time")
+            st.plotly_chart(fig_trend, use_container_width=True)
+    except Exception:
+        st.info("Trend chart unavailable for this dataset.")
+
+c1, c2 = st.columns(2)
+
+with c1:
+    try:
+        if best_dim and best_dim in filtered_df.columns:
+            grouped = filtered_df.groupby(best_dim, as_index=False)[primary_metric].sum().sort_values(by=primary_metric, ascending=False).head(10)
+            fig_bar = px.bar(grouped, x=best_dim, y=primary_metric, title=f"Top {best_dim} by {primary_metric}")
+            st.plotly_chart(fig_bar, use_container_width=True)
+    except Exception:
+        st.info("Top-segment chart unavailable.")
+
+with c2:
+    try:
+        fig_hist = px.histogram(filtered_df, x=primary_metric, nbins=30, title=f"Distribution of {primary_metric}")
+        st.plotly_chart(fig_hist, use_container_width=True)
+    except Exception:
+        st.info("Distribution chart unavailable.")
+
+
+# =========================================================
+# CORRELATION HEATMAP
+# =========================================================
+if len(safe_numeric_cols) >= 2:
     st.subheader("Correlation Heatmap")
-    corr = filtered_df[numeric_cols].corr(numeric_only=True)
-    corr_fig = px.imshow(corr, text_auto=True, aspect="auto", title="Numeric Correlation Matrix")
-    st.plotly_chart(corr_fig, width="stretch")
+    st.markdown("**Numeric Correlation Matrix**")
+    try:
+        corr_matrix = filtered_df[safe_numeric_cols].apply(pd.to_numeric, errors="coerce").corr(numeric_only=True)
+        if not corr_matrix.empty and corr_matrix.shape[0] >= 2:
+            fig_heat = px.imshow(corr_matrix, text_auto=True, aspect="auto", color_continuous_scale="Blues")
+            st.plotly_chart(fig_heat, use_container_width=True)
+    except Exception:
+        st.info("Correlation heatmap unavailable.")
 
-st.markdown("---")
 
-
-# =========================
-# Data preview and export
-# =========================
+# =========================================================
+# PREVIEW + DOWNLOADS
+# =========================================================
 st.subheader("Preview Data")
-st.dataframe(filtered_df.head(100), width="stretch")
+st.dataframe(filtered_df.head(50), use_container_width=True)
 
-report_df = make_download_report(summary, risks, recommendations, quality_score, evaluation_df)
-report_csv = dataframe_to_csv_bytes(report_df)
-filtered_csv = dataframe_to_csv_bytes(filtered_df)
-evaluation_csv = dataframe_to_csv_bytes(evaluation_df) if not evaluation_df.empty else b""
+d1, d2, d3 = st.columns(3)
 
-export1, export2, export3 = st.columns(3)
-export1.download_button(
-    "Download filtered dataset as CSV",
-    data=filtered_csv,
-    file_name="filtered_client_intelligence_data.csv",
-    mime="text/csv",
-)
-export2.download_button(
-    "Download insights report as CSV",
-    data=report_csv,
-    file_name="client_intelligence_insights_report.csv",
-    mime="text/csv",
-)
-export3.download_button(
-    "Download evaluation table as CSV",
-    data=evaluation_csv,
-    file_name="insight_evaluation_table.csv",
-    mime="text/csv",
-    disabled=evaluation_df.empty,
-)
+with d1:
+    st.download_button(
+        "Download filtered dataset as CSV",
+        data=to_csv_download(filtered_df),
+        file_name="filtered_dataset.csv",
+        mime="text/csv"
+    )
+
+with d2:
+    insights_df = pd.DataFrame([
+        {
+            "engine": x["engine"],
+            "title": x["title"],
+            "statement": x["statement"],
+            "insight_type": x["insight_type"],
+            "metric": x.get("metric"),
+            "dimension": x.get("dimension"),
+            "entity": x.get("entity"),
+            "direction": x.get("direction"),
+            "evidence": x.get("evidence"),
+            "base_confidence": x.get("base_confidence"),
+            "final_score": x.get("final_score")
+        }
+        for x in all_engine_insights
+    ])
+
+    st.download_button(
+        "Download insights report as CSV",
+        data=to_csv_download(insights_df),
+        file_name="insights_report.csv",
+        mime="text/csv"
+    )
+
+with d3:
+    st.download_button(
+        "Download evaluation table as CSV",
+        data=to_csv_download(benchmark_df),
+        file_name="benchmark_evaluation.csv",
+        mime="text/csv"
+    )
 
 st.markdown("---")
-st.caption(
-    "Next research upgrade: replace the Narrative Engine with a real LLM-backed engine and compare prompt outputs against rule-based and statistical baselines."
-)
+st.caption("Next research-grade upgrade: row-level retrieval index, structured evidence citations, prompt benchmarking across datasets, and failure-mode dashboard.")
